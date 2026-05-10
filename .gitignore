@@ -1,6 +1,133 @@
 # Customized
 unittest/
 
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Virtual Environment
+# =========================
+.env
+.venv
+venv/
+env/
+ENV/
+
+# Conda
+.conda/
+conda-meta/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Logs
+# =========================
+logs/
+log/
+*.log
+wandb/
+runs/
+tensorboard/
+events.out.tfevents.*
+
+# =========================
+# PyTorch / Deep Learning
+# =========================
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+checkpoints/
+weights/
+pretrained/
+snapshots/
+modelsave/
+save_model/
+save_model_pt/
+
+# =========================
+# Medical Images
+# =========================
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.nrrd
+*.dcm
+
+# =========================
+# Dataset
+# =========================
+data/
+dataset/
+datasets/
+cache/
+tmp/
+temp/
+
+# =========================
+# Outputs / Results
+# =========================
+outputs/
+output/
+results/
+visualization/
+vis/
+pred/
+prediction/
+inference/
+experiments/
+
+# =========================
+# VSCode / IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# macOS
+# =========================
+.DS_Store
+
+# =========================
+# Linux
+# =========================
+*.swp
+*.swo
+
+# =========================
+# Build
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# CUDA / Compile
+# =========================
+*.so
+*.o
+*.a
+
+# =========================
+# TMUX / Screen
+# =========================
+.screenrc
+.tmux/
+
+# =========================
+# Misc
+# =========================
+nohup.out
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
