@@ -48,8 +48,7 @@ def build_command(args: argparse.Namespace, case_dir: Path) -> List[str]:
         args.target_shape,
         "--target-spacing",
         args.target_spacing,
-        "--ct-clip",
-        args.ct_clip,
+        f"--ct-clip={args.ct_clip}",
     ]
     if args.bone_structures:
         command.extend(["--bone-structures", args.bone_structures])

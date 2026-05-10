@@ -62,8 +62,7 @@ def build_command(args: argparse.Namespace, row: Dict[str, str]) -> List[str]:
         args.target_shape,
         "--target-spacing",
         args.target_spacing,
-        "--ct-clip",
-        args.ct_clip,
+        f"--ct-clip={args.ct_clip}",
     ]
     if args.skip_shape_check:
         command.append("--skip-shape-check")

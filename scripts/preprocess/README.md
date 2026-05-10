@@ -35,6 +35,13 @@ The script resamples to 2 mm isotropic spacing, center crops/pads to
 `(160, 160, 192)`, normalizes CT intensities from `[-1024, 3000]` to `[0, 1]`,
 and uses nearest-neighbor interpolation for labels.
 
+If you override the CT clipping range manually, use the equals form because the
+default lower bound is negative:
+
+```bash
+--ct-clip=-1024,3000
+```
+
 ## Prepare a Batch
 
 Create a CSV manifest:
