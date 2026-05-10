@@ -40,6 +40,10 @@ case_id,ct,seg_o,seg_b
 case001,raw_aligned/case001_ct.nii.gz,raw_aligned/case001_oar.nii.gz,raw_aligned/case001_bone.nii.gz
 ```
 
+SegRap-style per-structure directories can be prepared directly with
+`scripts/preprocess/prepare_segrap_case.py` or
+`scripts/preprocess/prepare_segrap_batch.py`.
+
 ## Array Requirements
 
 Full-resolution arrays:

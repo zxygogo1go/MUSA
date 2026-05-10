@@ -51,6 +51,14 @@ python scripts/preprocess/prepare_batch.py \
   --out-root data
 ```
 
+For SegRap-style case folders with per-structure masks, use:
+
+```bash
+python scripts/preprocess/prepare_segrap_batch.py \
+  --cases-root /path/to/SegRap2023_Training_Set_120cases \
+  --out-root data
+```
+
 Then create training and validation lists:
 
 ```bash

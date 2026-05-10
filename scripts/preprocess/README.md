@@ -53,6 +53,55 @@ python scripts/preprocess/prepare_batch.py \
   --out-root data
 ```
 
+## Prepare SegRap-Style Cases
+
+For a case directory like:
+
+```text
+segrap_0000/
+  image.nii.gz
+  Brain.nii.gz
+  BrainStem.nii.gz
+  Mandible_L.nii.gz
+  Mandible_R.nii.gz
+  ...
+```
+
+run:
+
+```bash
+python scripts/preprocess/prepare_segrap_case.py \
+  --case-dir /path/to/segrap_0000 \
+  --out-root data
+```
+
+For a folder containing many `segrap_*` cases:
+
+```bash
+python scripts/preprocess/prepare_segrap_batch.py \
+  --cases-root /path/to/SegRap2023_Training_Set_120cases \
+  --out-root data
+```
+
+`seg_o` is built by assigning one integer label to each non-bone structure mask.
+`seg_b` is built as a binary union of these structures by default:
+
+```text
+ETbone_L, ETbone_R, Mandible_L, Mandible_R, Mastoid_L, Mastoid_R, TMjoint_L, TMjoint_R
+```
+
+You can override the bone list:
+
+```bash
+python scripts/preprocess/prepare_segrap_case.py \
+  --case-dir /path/to/segrap_0000 \
+  --out-root data \
+  --bone-structures Mandible_L,Mandible_R,ETbone_L,ETbone_R
+```
+
+If you need bone labels to also appear in `seg_o`, add
+`--include-bone-in-seg-o`.
+
 ## Make Train/Validation Lists
 
 After saving preprocessed arrays to `data/images/*.npy`, generate list files:
