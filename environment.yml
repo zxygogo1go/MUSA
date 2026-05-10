@@ -1,0 +1,19 @@
+name: dir-musa
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch>=1.13
+  - torchvision
+  - pytorch-cuda=11.8
+  - numpy>=1.20
+  - scipy>=1.7
+  - matplotlib>=3.3
+  - scikit-image>=0.18
+  - nibabel>=3.2
+  - pip
+  - pip:
+      - timm>=0.6.0
+      - ml-collections>=0.1.0
