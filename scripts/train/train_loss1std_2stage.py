@@ -127,7 +127,7 @@ else:
 trn_files = musa.utils_dataloader.read_file_list(args.trn_list)
 val_files = musa.utils_dataloader.read_file_list(args.val_list)
 
-trn_dataset = musa.utils_dataloader.myDataset_trn(trn_files)
+trn_dataset = musa.utils_dataloader.myDataset_trn(trn_files, args.vol_path)
 val_dataset = musa.utils_dataloader.myDataset_val(val_files, args.vol_path, args.seg_path_o, args.seg_path_b)
 if os.environ.get('MUSA_SEG_O_CLASSES') is None:
     os.environ['MUSA_SEG_O_CLASSES'] = str(musa.utils_dataprep.max_label_in_folder(args.seg_path_o) + 1)
