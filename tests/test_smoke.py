@@ -52,6 +52,15 @@ class SmokeTests(unittest.TestCase):
 
         np.testing.assert_allclose(warped.detach().numpy(), src.detach().numpy(), atol=1e-5)
 
+    def test_dataprep_onehot(self):
+        import musa
+
+        seg = torch.tensor([[[[[0, 1], [2, 0]], [[1, 2], [0, 0]]]]])
+        onehot = musa.utils_dataprep.to_onehot(seg, num_classes=3)
+
+        self.assertEqual(tuple(onehot.shape), (1, 3, 2, 2, 2))
+        self.assertTrue(torch.allclose(onehot.sum(dim=1), torch.ones(1, 2, 2, 2)))
+
 
 if __name__ == "__main__":
     unittest.main()

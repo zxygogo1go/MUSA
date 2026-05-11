@@ -17,8 +17,11 @@ def dice_val_both(masks_seg_o, masks_seg_b, DEBUG=False):
         print('\n\n\n')
         print('dice_o: ', dice_o.shape, dice_o)
     
-    # remove the 12th element (mandible)
-    dice_o = torch.cat((dice_o[:, :11], dice_o[:, 12:]), dim=1) # torch.Size([1, 16])
+    # Original MUSA data removed the 12th organ channel (mandible) because bone
+    # was evaluated separately. For other datasets, only apply this when that
+    # channel exists.
+    if dice_o.shape[1] > 12:
+        dice_o = torch.cat((dice_o[:, :11], dice_o[:, 12:]), dim=1)
     
     dice_all = torch.cat((dice_o, dice_b), dim=1) # torch.Size([1, 25])
     
