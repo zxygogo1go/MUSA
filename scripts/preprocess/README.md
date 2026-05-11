@@ -111,7 +111,22 @@ If you need bone labels to also appear in `seg_o`, add
 
 ## Make Train/Validation Lists
 
-After saving preprocessed arrays to `data/images/*.npy`, generate list files:
+After saving preprocessed arrays to `data/images/*.npy`, validate the prepared
+folders:
+
+```bash
+python scripts/preprocess/validate_prepared_data.py \
+  --data-root data
+```
+
+Then create a validation-pair CSV such as:
+
+```text
+segrap_0000,segrap_0001
+segrap_0002,segrap_0003
+```
+
+Generate list files:
 
 ```bash
 python scripts/preprocess/make_lists.py \

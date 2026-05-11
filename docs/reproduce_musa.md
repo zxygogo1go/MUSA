@@ -62,6 +62,9 @@ python scripts/preprocess/prepare_segrap_batch.py \
 Then create training and validation lists:
 
 ```bash
+python scripts/preprocess/validate_prepared_data.py \
+  --data-root data
+
 python scripts/preprocess/make_lists.py \
   --image-dir data/images \
   --train-out data/lists/trn_list_inter.txt \
