@@ -146,6 +146,22 @@ python scripts/infer/infer_prepared_pair.py \
 This saves `.npy` outputs for the deformed image, composed DVF, warped
 segmentations, and a JSON metrics file with Dice before/after registration.
 
+To evaluate all validation pairs and write aggregate metrics:
+
+```bash
+python scripts/infer/eval_prepared_pairs.py \
+  --pairs-csv data/lists/val_pairs.csv \
+  --data-root data \
+  --model-type 01voxelmorph-v1 \
+  --checkpoint-stage1 outputs/loss3_m01_stage1_r2/checkpoint-cont0050/0500.pth \
+  --checkpoint-stage2 outputs/loss3_m01_stage2_r1_from_stage1_0500/checkpoint/0500.pth \
+  --output-dir outputs/eval_m01_loss3 \
+  --gpu 0
+```
+
+Add `--save-pair-outputs` if you also want per-pair warped images, DVFs, and
+warped segmentations saved under `outputs/eval_m01_loss3/pairs/`.
+
 After preprocessing a moving/fixed pair to `(160, 160, 192)`, run:
 
 ```bash
