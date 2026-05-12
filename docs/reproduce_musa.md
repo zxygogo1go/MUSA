@@ -129,6 +129,23 @@ Repeat the same two-stage recipe with:
 
 ## 5. Inference with Pretrained Weights
 
+For prepared `.npy` data produced by this repository, run:
+
+```bash
+python scripts/infer/infer_prepared_pair.py \
+  --moving-id segrap_0000 \
+  --fixed-id segrap_0001 \
+  --data-root data \
+  --model-type 01voxelmorph-v1 \
+  --checkpoint-stage1 outputs/loss3_m01_stage1_r2/checkpoint-cont0050/0500.pth \
+  --checkpoint-stage2 outputs/loss3_m01_stage2_r1_from_stage1_0500/checkpoint/0500.pth \
+  --output-dir outputs/infer_m01_loss3/segrap_0000_to_segrap_0001 \
+  --gpu 0
+```
+
+This saves `.npy` outputs for the deformed image, composed DVF, warped
+segmentations, and a JSON metrics file with Dice before/after registration.
+
 After preprocessing a moving/fixed pair to `(160, 160, 192)`, run:
 
 ```bash
