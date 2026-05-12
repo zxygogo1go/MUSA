@@ -162,6 +162,20 @@ python scripts/infer/eval_prepared_pairs.py \
 Add `--save-pair-outputs` if you also want per-pair warped images, DVFs, and
 warped segmentations saved under `outputs/eval_m01_loss3/pairs/`.
 
+To visualize one saved pair and diagnose residual mismatch or flow issues:
+
+```bash
+python scripts/infer/visualize_prepared_pair.py \
+  --pair-dir outputs/infer_m01_loss3/segrap_0000_to_segrap_0001 \
+  --data-root data \
+  --moving-id segrap_0000 \
+  --fixed-id segrap_0001
+```
+
+The visualization output includes CT alignment panels, segmentation contour
+overlays, DVF magnitude/Jacobian diagnostics, worst-OAR Dice bars, local overlays
+for low-Dice OARs, and `low_oar_dice.csv`.
+
 After preprocessing a moving/fixed pair to `(160, 160, 192)`, run:
 
 ```bash
