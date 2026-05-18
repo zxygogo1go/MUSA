@@ -176,6 +176,20 @@ The visualization output includes CT alignment panels, segmentation contour
 overlays, DVF magnitude/Jacobian diagnostics, worst-OAR Dice bars, local overlays
 for low-Dice OARs, and `low_oar_dice.csv`.
 
+To compare two evaluated models, for example M01 and M05:
+
+```bash
+python scripts/infer/compare_eval_summaries.py \
+  --a-name M01 \
+  --a-summary outputs/eval_m01_loss3/summary.csv \
+  --b-name M05 \
+  --b-summary outputs/eval_m05_loss3/summary.csv \
+  --output-dir outputs/compare_m01_m05_loss3
+```
+
+This writes pair-level differences, aggregate JSON, mean-bar plots, and
+per-pair scatter plots where points above the diagonal favor M05.
+
 After preprocessing a moving/fixed pair to `(160, 160, 192)`, run:
 
 ```bash
