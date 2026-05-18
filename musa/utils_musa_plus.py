@@ -1,0 +1,315 @@
+"""Utilities for the MUSA+ Stage-3 local refinement prototype."""
+
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+
+
+DEFAULT_SMALL_OAR_NAMES: Tuple[str, ...] = (
+    "OpticNerve_L",
+    "OpticNerve_R",
+    "Cochlea_L",
+    "Cochlea_R",
+    "Lens_L",
+    "Lens_R",
+    "Pituitary",
+    "Chiasm",
+    "IAC_L",
+    "IAC_R",
+    "MiddleEar_L",
+    "MiddleEar_R",
+    "TympanicCavity_L",
+    "TympanicCavity_R",
+    "VestibulSemi_L",
+    "VestibulSemi_R",
+)
+
+
+def parse_label_list(value: Optional[str]) -> List[int]:
+    """Parse a comma-separated label list into sorted positive integers."""
+
+    if value is None or value.strip() == "":
+        return []
+    labels = []
+    for part in value.split(","):
+        text = part.strip()
+        if not text:
+            continue
+        label = int(text)
+        if label <= 0:
+            raise ValueError(f"Small-OAR labels must be positive, got {label}")
+        labels.append(label)
+    return sorted(set(labels))
+
+
+def parse_name_list(value: Optional[str]) -> List[str]:
+    """Parse a comma-separated name list."""
+
+    if value is None or value.strip() == "":
+        return list(DEFAULT_SMALL_OAR_NAMES)
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _metadata_files(metadata_path: Path) -> List[Path]:
+    if metadata_path.is_file():
+        return [metadata_path]
+    if metadata_path.is_dir():
+        return sorted(metadata_path.glob("*.json"))
+    return []
+
+
+def resolve_small_oar_labels(
+    small_oar_labels: Optional[str] = None,
+    small_oar_names: Optional[str] = None,
+    metadata_path: Optional[str] = None,
+) -> List[int]:
+    """Resolve small-OAR labels from explicit labels or SegRap metadata.
+
+    Explicit labels take precedence. When labels are omitted, this reads
+    `metadata/*.json` files emitted by `prepare_segrap_case.py` and maps known
+    small-OAR structure names to their integer labels.
+    """
+
+    labels = parse_label_list(small_oar_labels)
+    if labels:
+        return labels
+
+    if metadata_path is None:
+        return []
+
+    names = set(parse_name_list(small_oar_names))
+    resolved = set()
+    for path in _metadata_files(Path(metadata_path)):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        label_map: Dict[str, int] = payload.get("label_map", {})
+        for name in names:
+            if name in label_map:
+                resolved.add(int(label_map[name]))
+    return sorted(label for label in resolved if label > 0)
+
+
+def seg_to_label_mask(seg: torch.Tensor, labels: Sequence[int]) -> torch.Tensor:
+    """Convert an integer segmentation to a binary mask for selected labels."""
+
+    if seg.ndim == 4:
+        seg = seg.unsqueeze(1)
+    if seg.ndim != 5 or seg.shape[1] != 1:
+        raise ValueError(f"Expected segmentation shape (B,1,H,W,D) or (B,H,W,D), got {tuple(seg.shape)}")
+
+    mask = torch.zeros_like(seg, dtype=torch.bool)
+    seg_long = seg.long()
+    for label in labels:
+        mask = torch.logical_or(mask, seg_long == int(label))
+    return mask.float()
+
+
+def seg_to_foreground_mask(seg: torch.Tensor) -> torch.Tensor:
+    """Return all non-background labels as a binary mask."""
+
+    if seg.ndim == 4:
+        seg = seg.unsqueeze(1)
+    if seg.ndim != 5 or seg.shape[1] != 1:
+        raise ValueError(f"Expected segmentation shape (B,1,H,W,D) or (B,H,W,D), got {tuple(seg.shape)}")
+    return (seg > 0).float()
+
+
+def binary_dice_per_batch(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """Soft binary Dice score for each batch item."""
+
+    pred = pred.float()
+    target = target.float()
+    dims = tuple(range(1, pred.ndim))
+    intersection = (pred * target).sum(dim=dims)
+    denominator = pred.sum(dim=dims) + target.sum(dim=dims)
+    empty = denominator <= eps
+    dice = (2.0 * intersection + eps) / (denominator + eps)
+    return torch.where(empty, torch.ones_like(dice), dice)
+
+
+def binary_dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """Mean soft binary Dice loss."""
+
+    return 1.0 - binary_dice_per_batch(pred, target, eps=eps).mean()
+
+
+def estimate_pair_difficulty(
+    moving: torch.Tensor,
+    fixed: torch.Tensor,
+    moving_oar_mask: torch.Tensor,
+    fixed_oar_mask: torch.Tensor,
+    moving_bone_mask: torch.Tensor,
+    fixed_bone_mask: torch.Tensor,
+    weights: Tuple[float, float, float] = (0.4, 0.4, 0.2),
+) -> torch.Tensor:
+    """Rule-based pair difficulty score in [0, 1].
+
+    The first Phase-1 version follows the research plan:
+
+    `w1 * (1 - initial_bone_dice) + w2 * (1 - initial_oar_dice) + w3 * image_mse`.
+    """
+
+    bone_dice = binary_dice_per_batch(moving_bone_mask, fixed_bone_mask)
+    oar_dice = binary_dice_per_batch(moving_oar_mask, fixed_oar_mask)
+    image_mse = (moving.float() - fixed.float()).pow(2).flatten(1).mean(dim=1)
+    image_mse = image_mse.clamp(0.0, 1.0)
+
+    w_bone, w_oar, w_img = weights
+    difficulty = w_bone * (1.0 - bone_dice) + w_oar * (1.0 - oar_dice) + w_img * image_mse
+    return difficulty.clamp(0.0, 1.0)
+
+
+def difficulty_to_value(difficulty: torch.Tensor, value_min: float, value_max: float) -> torch.Tensor:
+    """Linearly map difficulty in [0, 1] to `[value_min, value_max]`."""
+
+    return value_min + difficulty.float().clamp(0.0, 1.0) * (value_max - value_min)
+
+
+def difficulty_to_radius(difficulty: torch.Tensor, radius_min: int, radius_max: int) -> int:
+    """Map mean batch difficulty to an integer ROI dilation radius."""
+
+    if radius_min < 0 or radius_max < radius_min:
+        raise ValueError(f"Invalid radius range: {radius_min}..{radius_max}")
+    value = difficulty_to_value(difficulty.mean(), float(radius_min), float(radius_max))
+    return int(torch.round(value).item())
+
+
+def build_roi_gate(mask: torch.Tensor, radius: int, smooth_steps: int = 2) -> torch.Tensor:
+    """Build a dilated smooth ROI gate from a binary small-OAR mask."""
+
+    if mask.ndim != 5 or mask.shape[1] != 1:
+        raise ValueError(f"Expected mask shape (B,1,H,W,D), got {tuple(mask.shape)}")
+    if radius < 0:
+        raise ValueError(f"radius must be non-negative, got {radius}")
+
+    hard_mask = (mask > 0).float()
+    if radius == 0:
+        gate = hard_mask
+    else:
+        kernel_size = 2 * radius + 1
+        gate = F.max_pool3d(hard_mask, kernel_size=kernel_size, stride=1, padding=radius)
+
+    for _ in range(max(0, int(smooth_steps))):
+        gate = F.avg_pool3d(gate, kernel_size=3, stride=1, padding=1)
+        gate = torch.maximum(gate, hard_mask)
+    return gate.clamp(0.0, 1.0)
+
+
+def normalize_dvf_magnitude(dvf: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Return a per-case normalized DVF magnitude channel."""
+
+    magnitude = torch.sqrt(dvf.float().pow(2).sum(dim=1, keepdim=True) + eps)
+    flat = magnitude.flatten(1)
+    scale = torch.quantile(flat, q=0.95, dim=1).clamp_min(eps)
+    scale = scale.view(-1, 1, 1, 1, 1)
+    return (magnitude / scale).clamp(0.0, 1.0)
+
+
+def build_anatomy_maps(
+    fixed_bone_mask: torch.Tensor,
+    roi_gate: torch.Tensor,
+    difficulty: torch.Tensor,
+    smooth_base: float = 1.0,
+    smooth_bone: float = 4.0,
+    smooth_boundary: float = 2.0,
+    smooth_difficulty: float = 1.0,
+    mag_inside: float = 0.2,
+    mag_outside: float = 6.0,
+    mag_bone: float = 4.0,
+) -> Dict[str, torch.Tensor]:
+    """Create rule-based anatomy-conditioned regularization maps."""
+
+    if fixed_bone_mask.shape != roi_gate.shape:
+        raise ValueError(f"fixed_bone_mask shape {tuple(fixed_bone_mask.shape)} != roi_gate {tuple(roi_gate.shape)}")
+
+    fixed_bone_mask = fixed_bone_mask.float().clamp(0.0, 1.0)
+    roi_gate = roi_gate.float().clamp(0.0, 1.0)
+    outside_roi = (1.0 - roi_gate).clamp(0.0, 1.0)
+    pooled = F.avg_pool3d(roi_gate, kernel_size=3, stride=1, padding=1)
+    boundary = (roi_gate - pooled).abs().clamp(0.0, 1.0)
+    diff = difficulty.float().view(-1, 1, 1, 1, 1).clamp(0.0, 1.0)
+
+    r_smooth = (
+        smooth_base
+        + smooth_bone * fixed_bone_mask
+        + smooth_boundary * boundary
+        + smooth_difficulty * diff * roi_gate
+    )
+    r_mag = mag_inside * roi_gate + mag_outside * outside_roi + mag_bone * fixed_bone_mask
+    r_refine = roi_gate * (1.0 + diff)
+    return {"smooth": r_smooth, "magnitude": r_mag, "refine": r_refine}
+
+
+def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """MSE inside a soft mask."""
+
+    weight = mask.float()
+    while weight.ndim < pred.ndim:
+        weight = weight.unsqueeze(1)
+    numerator = ((pred - target).pow(2) * weight).sum()
+    denominator = weight.sum() * pred.shape[1] + eps
+    return numerator / denominator
+
+
+def weighted_gradient_loss(dvf: torch.Tensor, weight_map: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Weighted first-order smoothness loss for a DVF."""
+
+    weight_map = weight_map.float()
+    dx = dvf[:, :, 1:, :, :] - dvf[:, :, :-1, :, :]
+    dy = dvf[:, :, :, 1:, :] - dvf[:, :, :, :-1, :]
+    dz = dvf[:, :, :, :, 1:] - dvf[:, :, :, :, :-1]
+    wx = 0.5 * (weight_map[:, :, 1:, :, :] + weight_map[:, :, :-1, :, :])
+    wy = 0.5 * (weight_map[:, :, :, 1:, :] + weight_map[:, :, :, :-1, :])
+    wz = 0.5 * (weight_map[:, :, :, :, 1:] + weight_map[:, :, :, :, :-1])
+
+    channels = dvf.shape[1]
+    loss_x = (dx.pow(2) * wx).sum() / (wx.sum() * channels + eps)
+    loss_y = (dy.pow(2) * wy).sum() / (wy.sum() * channels + eps)
+    loss_z = (dz.pow(2) * wz).sum() / (wz.sum() * channels + eps)
+    return (loss_x + loss_y + loss_z) / 3.0
+
+
+def weighted_magnitude_loss(dvf: torch.Tensor, weight_map: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Weighted residual DVF magnitude loss."""
+
+    channels = dvf.shape[1]
+    weight_map = weight_map.float()
+    return (dvf.pow(2) * weight_map).sum() / (weight_map.sum() * channels + eps)
+
+
+def make_stage3_inputs(
+    fixed: torch.Tensor,
+    deformed_stage2: torch.Tensor,
+    fixed_small_mask: torch.Tensor,
+    warped_small_mask_stage2: torch.Tensor,
+    dvf_stage2: torch.Tensor,
+    fixed_bone_mask: torch.Tensor,
+    warped_bone_mask_stage2: torch.Tensor,
+) -> torch.Tensor:
+    """Assemble the Phase-1 Stage-3 feature tensor."""
+
+    dvf_magnitude = normalize_dvf_magnitude(dvf_stage2)
+    return torch.cat(
+        (
+            fixed.float(),
+            deformed_stage2.float(),
+            fixed_small_mask.float(),
+            warped_small_mask_stage2.float(),
+            dvf_magnitude.float(),
+            fixed_bone_mask.float(),
+            warped_bone_mask_stage2.float(),
+        ),
+        dim=1,
+    )
+
+
+def checkpoint_to_state_dict(payload: object) -> Dict[str, torch.Tensor]:
+    """Extract a PyTorch state dict from common checkpoint payloads."""
+
+    if isinstance(payload, dict) and "model_state_dict" in payload:
+        return payload["model_state_dict"]
+    if isinstance(payload, dict):
+        return payload
+    raise ValueError(f"Unsupported checkpoint payload type: {type(payload)}")

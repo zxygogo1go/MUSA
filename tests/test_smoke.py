@@ -61,6 +61,43 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(tuple(onehot.shape), (1, 3, 2, 2, 2))
         self.assertTrue(torch.allclose(onehot.sum(dim=1), torch.ones(1, 2, 2, 2)))
 
+    def test_musa_plus_masks_roi_and_difficulty(self):
+        import musa
+
+        seg = torch.tensor([[[[[0, 1, 0], [2, 0, 0], [0, 0, 0]],
+                              [[0, 0, 0], [0, 3, 0], [0, 0, 0]],
+                              [[0, 0, 0], [0, 0, 0], [0, 0, 0]]]]])
+        mask = musa.utils_musa_plus.seg_to_label_mask(seg, labels=[1, 3])
+        self.assertEqual(tuple(mask.shape), (1, 1, 3, 3, 3))
+        self.assertEqual(float(mask.sum()), 2.0)
+
+        gate = musa.utils_musa_plus.build_roi_gate(mask, radius=1, smooth_steps=1)
+        self.assertEqual(tuple(gate.shape), tuple(mask.shape))
+        self.assertGreater(float(gate.sum()), float(mask.sum()))
+        self.assertTrue(torch.all(gate >= 0))
+        self.assertTrue(torch.all(gate <= 1))
+
+        moving = torch.zeros(1, 1, 3, 3, 3)
+        fixed = moving.clone()
+        difficulty = musa.utils_musa_plus.estimate_pair_difficulty(
+            moving,
+            fixed,
+            moving_oar_mask=mask,
+            fixed_oar_mask=mask,
+            moving_bone_mask=mask,
+            fixed_bone_mask=mask,
+        )
+        self.assertTrue(torch.allclose(difficulty, torch.zeros_like(difficulty)))
+
+    def test_musa_plus_local_residual_unet_shape(self):
+        from musa.registration_models.musa_plus import LocalResidualUNet
+
+        model = LocalResidualUNet(in_channels=7, filters=(2, 4, 8), instance_norm=False)
+        x = torch.randn(1, 7, 8, 8, 8)
+        y = model(x)
+
+        self.assertEqual(tuple(y.shape), (1, 3, 8, 8, 8))
+
 
 if __name__ == "__main__":
     unittest.main()
