@@ -123,6 +123,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-mag", type=float, default=0.01, help="Weighted residual magnitude penalty.")
     parser.add_argument("--lambda-preserve-large", type=float, default=0.50, help="Large-OAR preservation weight.")
     parser.add_argument("--lambda-preserve-bone", type=float, default=0.50, help="Bone preservation weight.")
+    parser.add_argument(
+        "--best-policy",
+        default="noharm",
+        choices=["noharm", "small-final"],
+        help="Which validation policy writes best_stage3.pth. noharm penalizes folding and large/bone degradation.",
+    )
+    parser.add_argument("--best-jacobian-penalty", type=float, default=5.0, help="Penalty for ROI Jacobian <= 0 ratio.")
+    parser.add_argument("--best-large-drop-penalty", type=float, default=2.0, help="Penalty for negative large-OAR delta.")
+    parser.add_argument("--best-bone-drop-penalty", type=float, default=2.0, help="Penalty for negative bone delta.")
+    parser.add_argument("--best-residual-p95-penalty", type=float, default=0.0, help="Optional penalty for ROI residual p95.")
     return parser.parse_args()
 
 
@@ -271,6 +281,7 @@ def stage3_forward(
     small_oar_labels: Sequence[int],
     args: argparse.Namespace,
     device: torch.device,
+    compute_jacobian: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     moving, fixed, moving_seg_o, fixed_seg_o, moving_seg_b, fixed_seg_b, _, _ = batch_to_device(batch, device)
 
@@ -386,6 +397,20 @@ def stage3_forward(
         bone_stage2_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_bone_stage2, fixed_bone).mean()
         bone_final_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_bone_final, fixed_bone).mean()
         residual_stats = musa.utils_musa_plus.magnitude_stats(gated_local_dvf, roi_gate)
+        if compute_jacobian:
+            stage2_jac = musa.utils_musa_plus.jacobian_stats(dvf_stage2, roi_gate)
+            final_jac = musa.utils_musa_plus.jacobian_stats(dvf_final, roi_gate)
+        else:
+            stage2_jac = {
+                "global_nonpos_ratio": 0.0,
+                "roi_nonpos_ratio": 0.0,
+                "roi_min": 0.0,
+            }
+            final_jac = {
+                "global_nonpos_ratio": 0.0,
+                "roi_nonpos_ratio": 0.0,
+                "roi_min": 0.0,
+            }
 
     metrics = {
         "loss": float(loss.detach().cpu()),
@@ -413,6 +438,12 @@ def stage3_forward(
         "residual_mag_roi_mean": residual_stats["roi_mean"],
         "residual_mag_roi_p95": residual_stats["roi_p95"],
         "residual_mag_roi_max": residual_stats["roi_max"],
+        "stage2_jac_nonpos": stage2_jac["global_nonpos_ratio"],
+        "stage2_jac_roi_nonpos": stage2_jac["roi_nonpos_ratio"],
+        "stage2_jac_roi_min": stage2_jac["roi_min"],
+        "final_jac_nonpos": final_jac["global_nonpos_ratio"],
+        "final_jac_roi_nonpos": final_jac["roi_nonpos_ratio"],
+        "final_jac_roi_min": final_jac["roi_min"],
     }
     return loss, metrics
 
@@ -435,8 +466,31 @@ def format_metrics(prefix: str, epoch: int, epochs: int, metrics: Dict[str, floa
         f"({metrics['large_delta']:+.4f}) - "
         f"bone {metrics['bone_stage2_dice']:.4f}->{metrics['bone_final_dice']:.4f} "
         f"({metrics['bone_delta']:+.4f}) - "
+        f"jac_roi<=0 {metrics.get('final_jac_roi_nonpos', 0.0):.3e} - "
         f"difficulty {metrics['difficulty']:.3f} - roi {metrics['roi_radius']:.1f}"
     )
+
+
+def noharm_score(metrics: Dict[str, float], args: argparse.Namespace) -> float:
+    """Validation score that rewards small-OAR improvement and penalizes harm."""
+
+    large_drop = max(0.0, -float(metrics["large_delta"]))
+    bone_drop = max(0.0, -float(metrics["bone_delta"]))
+    jac_roi = max(0.0, float(metrics.get("final_jac_roi_nonpos", 0.0)))
+    residual_p95 = max(0.0, float(metrics.get("residual_mag_roi_p95", 0.0)))
+    return (
+        float(metrics["small_delta"])
+        - args.best_large_drop_penalty * large_drop
+        - args.best_bone_drop_penalty * bone_drop
+        - args.best_jacobian_penalty * jac_roi
+        - args.best_residual_p95_penalty * residual_p95
+    )
+
+
+def selection_score(metrics: Dict[str, float], args: argparse.Namespace) -> float:
+    if args.best_policy == "small-final":
+        return float(metrics["small_final_dice"])
+    return noharm_score(metrics, args)
 
 
 def save_checkpoint(
@@ -447,6 +501,8 @@ def save_checkpoint(
     args: argparse.Namespace,
     small_oar_labels: Sequence[int],
     best_val_small_dice: float,
+    best_val_noharm_score: float,
+    best_val_selection_score: float,
     history: Dict[str, List[Dict[str, float]]],
 ) -> None:
     checkpoint = {
@@ -456,6 +512,9 @@ def save_checkpoint(
         "args": vars(args),
         "small_oar_labels": list(small_oar_labels),
         "best_val_small_dice": best_val_small_dice,
+        "best_val_noharm_score": best_val_noharm_score,
+        "best_val_selection_score": best_val_selection_score,
+        "best_policy": args.best_policy,
         "history": history,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -512,6 +571,8 @@ def main() -> None:
     optimizer = torch.optim.Adam(model_stage3.parameters(), lr=args.lr)
     epoch_start = 0
     best_val_small_dice = 0.0
+    best_val_noharm_score = float("-inf")
+    best_val_selection_score = float("-inf")
     history: Dict[str, List[Dict[str, float]]] = {"train": [], "val": []}
 
     if args.checkpoint_path is not None:
@@ -520,6 +581,8 @@ def main() -> None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         epoch_start = int(checkpoint["epoch"]) + 1
         best_val_small_dice = float(checkpoint.get("best_val_small_dice", 0.0))
+        best_val_noharm_score = float(checkpoint.get("best_val_noharm_score", float("-inf")))
+        best_val_selection_score = float(checkpoint.get("best_val_selection_score", float("-inf")))
         history = checkpoint.get("history", history)
         print(f"[INFO] Resumed Stage-3 checkpoint {args.checkpoint_path} at epoch {epoch_start}")
 
@@ -568,14 +631,54 @@ def main() -> None:
                         small_oar_labels=small_oar_labels,
                         args=args,
                         device=device,
+                        compute_jacobian=True,
                     )
                     val_rows.append(metrics)
             val_metrics = mean_metrics(val_rows)
             history["val"].append(val_metrics)
             print(format_metrics("Val", epoch + 1, args.epochs, val_metrics, time.time() - val_start), flush=True)
+            val_noharm_score = noharm_score(val_metrics, args)
+            val_selection_score = selection_score(val_metrics, args)
+            print(
+                f"[INFO] Val selection: policy={args.best_policy}, "
+                f"score={val_selection_score:.6f}, noharm={val_noharm_score:.6f}",
+                flush=True,
+            )
 
             if val_metrics["small_final_dice"] > best_val_small_dice:
                 best_val_small_dice = val_metrics["small_final_dice"]
+                save_checkpoint(
+                    out_dir / "best_stage3_small.pth",
+                    epoch,
+                    model_stage3,
+                    optimizer,
+                    args,
+                    small_oar_labels,
+                    best_val_small_dice,
+                    best_val_noharm_score,
+                    best_val_selection_score,
+                    history,
+                )
+                print(f"[INFO] Saved best small-Dice Stage-3 checkpoint with small Dice {best_val_small_dice:.4f}")
+
+            if val_noharm_score > best_val_noharm_score:
+                best_val_noharm_score = val_noharm_score
+                save_checkpoint(
+                    out_dir / "best_stage3_noharm.pth",
+                    epoch,
+                    model_stage3,
+                    optimizer,
+                    args,
+                    small_oar_labels,
+                    best_val_small_dice,
+                    best_val_noharm_score,
+                    best_val_selection_score,
+                    history,
+                )
+                print(f"[INFO] Saved best no-harm Stage-3 checkpoint with score {best_val_noharm_score:.6f}")
+
+            if val_selection_score > best_val_selection_score:
+                best_val_selection_score = val_selection_score
                 save_checkpoint(
                     out_dir / "best_stage3.pth",
                     epoch,
@@ -584,9 +687,11 @@ def main() -> None:
                     args,
                     small_oar_labels,
                     best_val_small_dice,
+                    best_val_noharm_score,
+                    best_val_selection_score,
                     history,
                 )
-                print(f"[INFO] Saved best Stage-3 checkpoint with small Dice {best_val_small_dice:.4f}")
+                print(f"[INFO] Saved selected best Stage-3 checkpoint with score {best_val_selection_score:.6f}")
 
         if (epoch + 1) % args.epoch_save == 0:
             checkpoint_path = checkpoint_dir / f"{epoch + 1:04d}.pth"
@@ -598,6 +703,8 @@ def main() -> None:
                 args,
                 small_oar_labels,
                 best_val_small_dice,
+                best_val_noharm_score,
+                best_val_selection_score,
                 history,
             )
             print(f"[INFO] Checkpoint saved to {checkpoint_path}")
@@ -610,6 +717,8 @@ def main() -> None:
         args,
         small_oar_labels,
         best_val_small_dice,
+        best_val_noharm_score,
+        best_val_selection_score,
         history,
     )
     print(f"[INFO] Final Stage-3 checkpoint saved to {out_dir / 'final_stage3.pth'}")
