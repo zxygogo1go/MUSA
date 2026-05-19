@@ -99,6 +99,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cudnn", choices=["det", "ben", "default"], default="ben", help="CUDNN mode.")
 
     parser.add_argument("--filters", default="8,16,32", help="Stage-3 U-Net filters, e.g. 8,16,32.")
+    parser.add_argument(
+        "--stage3-input-mode",
+        default="full",
+        choices=musa.utils_musa_plus.STAGE3_INPUT_MODES,
+        help=(
+            "Stage-3 information policy: full uses fixed small/bone masks; "
+            "no-fixed-small zeros fixed small mask and uses warped-moving ROI; "
+            "no-fixed-seg also zeros fixed bone and uses CT-only difficulty."
+        ),
+    )
     parser.add_argument("--roi-radius-min", type=int, default=3, help="Minimum small-OAR ROI dilation radius.")
     parser.add_argument("--roi-radius-max", type=int, default=8, help="Maximum small-OAR ROI dilation radius.")
     parser.add_argument("--roi-smooth-steps", type=int, default=2, help="Average-pool smoothing passes for ROI gate.")
@@ -273,15 +283,6 @@ def stage3_forward(
     moving_bone = (moving_seg_b > 0).float()
     fixed_bone = (fixed_seg_b > 0).float()
 
-    difficulty = musa.utils_musa_plus.estimate_pair_difficulty(
-        moving=moving,
-        fixed=fixed,
-        moving_oar_mask=moving_oar,
-        fixed_oar_mask=fixed_oar,
-        moving_bone_mask=moving_bone,
-        fixed_bone_mask=fixed_bone,
-    )
-
     deformed_stage2, dvf_stage2 = run_two_stage_frozen(
         moving=moving,
         fixed=fixed,
@@ -296,14 +297,30 @@ def stage3_forward(
     warped_large_stage2 = spatial_transformer_r1(moving_large, dvf_stage2, mode="bilinear").clamp(0.0, 1.0)
     warped_bone_stage2 = spatial_transformer_r1(moving_bone, dvf_stage2, mode="bilinear").clamp(0.0, 1.0)
 
-    roi_source = torch.maximum(fixed_small, warped_small_stage2.detach())
+    difficulty = musa.utils_musa_plus.estimate_pair_difficulty_by_mode(
+        input_mode=args.stage3_input_mode,
+        moving=moving,
+        fixed=fixed,
+        moving_oar_mask=moving_oar,
+        fixed_oar_mask=fixed_oar,
+        moving_bone_mask=moving_bone,
+        fixed_bone_mask=fixed_bone,
+        deformed_stage2=deformed_stage2,
+        dvf_stage2=dvf_stage2,
+    )
+    conditioning = musa.utils_musa_plus.stage3_conditioning_masks(
+        input_mode=args.stage3_input_mode,
+        fixed_small_mask=fixed_small,
+        warped_small_mask_stage2=warped_small_stage2,
+        fixed_bone_mask=fixed_bone,
+    )
     roi_radius = musa.utils_musa_plus.difficulty_to_radius(
         difficulty,
         radius_min=args.roi_radius_min,
         radius_max=args.roi_radius_max,
     )
     roi_gate = musa.utils_musa_plus.build_roi_gate(
-        roi_source,
+        conditioning["roi_source"],
         radius=roi_radius,
         smooth_steps=args.roi_smooth_steps,
     )
@@ -311,10 +328,10 @@ def stage3_forward(
     stage3_inputs = musa.utils_musa_plus.make_stage3_inputs(
         fixed=fixed,
         deformed_stage2=deformed_stage2,
-        fixed_small_mask=fixed_small,
+        fixed_small_mask=conditioning["fixed_small_feature"],
         warped_small_mask_stage2=warped_small_stage2,
         dvf_stage2=dvf_stage2,
-        fixed_bone_mask=fixed_bone,
+        fixed_bone_mask=conditioning["fixed_bone_feature"],
         warped_bone_mask_stage2=warped_bone_stage2,
     )
     raw_local_dvf = model_stage3(stage3_inputs)
@@ -333,7 +350,7 @@ def stage3_forward(
     warped_bone_final = spatial_transformer_r1(moving_bone, dvf_final, mode="bilinear").clamp(0.0, 1.0)
 
     anatomy_maps = musa.utils_musa_plus.build_anatomy_maps(
-        fixed_bone_mask=fixed_bone,
+        fixed_bone_mask=conditioning["anatomy_bone"],
         roi_gate=roi_gate,
         difficulty=difficulty,
     )
@@ -368,7 +385,7 @@ def stage3_forward(
         large_final_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_large_final, fixed_large).mean()
         bone_stage2_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_bone_stage2, fixed_bone).mean()
         bone_final_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_bone_final, fixed_bone).mean()
-        residual_mag = torch.sqrt(gated_local_dvf.pow(2).sum(dim=1) + 1e-6).mean()
+        residual_stats = musa.utils_musa_plus.magnitude_stats(gated_local_dvf, roi_gate)
 
     metrics = {
         "loss": float(loss.detach().cpu()),
@@ -390,7 +407,12 @@ def stage3_forward(
         "bone_stage2_dice": float(bone_stage2_dice.detach().cpu()),
         "bone_final_dice": float(bone_final_dice.detach().cpu()),
         "bone_delta": float((bone_final_dice - bone_stage2_dice).detach().cpu()),
-        "residual_mag_mean": float(residual_mag.detach().cpu()),
+        "residual_mag_mean": residual_stats["global_mean"],
+        "residual_mag_p95": residual_stats["global_p95"],
+        "residual_mag_max": residual_stats["global_max"],
+        "residual_mag_roi_mean": residual_stats["roi_mean"],
+        "residual_mag_roi_p95": residual_stats["roi_p95"],
+        "residual_mag_roi_max": residual_stats["roi_max"],
     }
     return loss, metrics
 
@@ -465,6 +487,7 @@ def main() -> None:
     print(f"[INFO] output={out_dir}")
     print(f"[INFO] metadata_path={metadata_path or '<none>'}")
     print(f"[INFO] small_oar_labels={small_oar_labels}")
+    print(f"[INFO] stage3_input_mode={args.stage3_input_mode}")
 
     trn_files = musa.utils_dataloader.read_file_list(args.trn_list)
     val_files = musa.utils_dataloader.read_file_list(args.val_list)

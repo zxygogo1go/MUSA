@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -25,6 +26,12 @@ DEFAULT_SMALL_OAR_NAMES: Tuple[str, ...] = (
     "TympanicCavity_R",
     "VestibulSemi_L",
     "VestibulSemi_R",
+)
+
+STAGE3_INPUT_MODES: Tuple[str, ...] = (
+    "full",
+    "no-fixed-small",
+    "no-fixed-seg",
 )
 
 
@@ -161,6 +168,63 @@ def estimate_pair_difficulty(
     return difficulty.clamp(0.0, 1.0)
 
 
+def estimate_pair_difficulty_ct_only(
+    moving: torch.Tensor,
+    fixed: torch.Tensor,
+    deformed_stage2: Optional[torch.Tensor] = None,
+    dvf_stage2: Optional[torch.Tensor] = None,
+    weights: Tuple[float, float, float] = (0.35, 0.45, 0.20),
+) -> torch.Tensor:
+    """Rule-based difficulty that does not use fixed/moving segmentations."""
+
+    initial_mse = (moving.float() - fixed.float()).pow(2).flatten(1).mean(dim=1).clamp(0.0, 1.0)
+    if deformed_stage2 is None:
+        stage2_mse = initial_mse
+    else:
+        stage2_mse = (deformed_stage2.float() - fixed.float()).pow(2).flatten(1).mean(dim=1).clamp(0.0, 1.0)
+    if dvf_stage2 is None:
+        flow_score = torch.zeros_like(initial_mse)
+    else:
+        flow_mag = torch.sqrt(dvf_stage2.float().pow(2).sum(dim=1) + 1e-6).flatten(1)
+        flow_score = (torch.quantile(flow_mag, q=0.95, dim=1) / 20.0).clamp(0.0, 1.0)
+
+    w_initial, w_stage2, w_flow = weights
+    difficulty = w_initial * initial_mse + w_stage2 * stage2_mse + w_flow * flow_score
+    return difficulty.clamp(0.0, 1.0)
+
+
+def estimate_pair_difficulty_by_mode(
+    input_mode: str,
+    moving: torch.Tensor,
+    fixed: torch.Tensor,
+    moving_oar_mask: torch.Tensor,
+    fixed_oar_mask: torch.Tensor,
+    moving_bone_mask: torch.Tensor,
+    fixed_bone_mask: torch.Tensor,
+    deformed_stage2: Optional[torch.Tensor] = None,
+    dvf_stage2: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Estimate pair difficulty using the selected Stage-3 information policy."""
+
+    if input_mode not in STAGE3_INPUT_MODES:
+        raise ValueError(f"Unsupported Stage-3 input mode {input_mode!r}; choices={STAGE3_INPUT_MODES}")
+    if input_mode == "no-fixed-seg":
+        return estimate_pair_difficulty_ct_only(
+            moving=moving,
+            fixed=fixed,
+            deformed_stage2=deformed_stage2,
+            dvf_stage2=dvf_stage2,
+        )
+    return estimate_pair_difficulty(
+        moving=moving,
+        fixed=fixed,
+        moving_oar_mask=moving_oar_mask,
+        fixed_oar_mask=fixed_oar_mask,
+        moving_bone_mask=moving_bone_mask,
+        fixed_bone_mask=fixed_bone_mask,
+    )
+
+
 def difficulty_to_value(difficulty: torch.Tensor, value_min: float, value_max: float) -> torch.Tensor:
     """Linearly map difficulty in [0, 1] to `[value_min, value_max]`."""
 
@@ -195,6 +259,43 @@ def build_roi_gate(mask: torch.Tensor, radius: int, smooth_steps: int = 2) -> to
         gate = F.avg_pool3d(gate, kernel_size=3, stride=1, padding=1)
         gate = torch.maximum(gate, hard_mask)
     return gate.clamp(0.0, 1.0)
+
+
+def stage3_conditioning_masks(
+    input_mode: str,
+    fixed_small_mask: torch.Tensor,
+    warped_small_mask_stage2: torch.Tensor,
+    fixed_bone_mask: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Return Stage-3 feature/ROI/anatomy masks for leakage ablations."""
+
+    if input_mode not in STAGE3_INPUT_MODES:
+        raise ValueError(f"Unsupported Stage-3 input mode {input_mode!r}; choices={STAGE3_INPUT_MODES}")
+
+    zeros_small = torch.zeros_like(fixed_small_mask)
+    zeros_bone = torch.zeros_like(fixed_bone_mask)
+    if input_mode == "full":
+        fixed_small_feature = fixed_small_mask
+        fixed_bone_feature = fixed_bone_mask
+        roi_source = torch.maximum(fixed_small_mask, warped_small_mask_stage2.detach())
+        anatomy_bone = fixed_bone_mask
+    elif input_mode == "no-fixed-small":
+        fixed_small_feature = zeros_small
+        fixed_bone_feature = fixed_bone_mask
+        roi_source = warped_small_mask_stage2.detach()
+        anatomy_bone = fixed_bone_mask
+    else:
+        fixed_small_feature = zeros_small
+        fixed_bone_feature = zeros_bone
+        roi_source = warped_small_mask_stage2.detach()
+        anatomy_bone = zeros_bone
+
+    return {
+        "fixed_small_feature": fixed_small_feature,
+        "fixed_bone_feature": fixed_bone_feature,
+        "roi_source": roi_source,
+        "anatomy_bone": anatomy_bone,
+    }
 
 
 def normalize_dvf_magnitude(dvf: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -277,6 +378,183 @@ def weighted_magnitude_loss(dvf: torch.Tensor, weight_map: torch.Tensor, eps: fl
     channels = dvf.shape[1]
     weight_map = weight_map.float()
     return (dvf.pow(2) * weight_map).sum() / (weight_map.sum() * channels + eps)
+
+
+def _summary_from_values(values: torch.Tensor) -> Dict[str, float]:
+    values = values.detach().float().flatten()
+    if values.numel() == 0:
+        return {"mean": 0.0, "p95": 0.0, "max": 0.0}
+    return {
+        "mean": float(values.mean().cpu()),
+        "p95": float(torch.quantile(values, q=0.95).cpu()),
+        "max": float(values.max().cpu()),
+    }
+
+
+def magnitude_stats(
+    dvf: torch.Tensor,
+    roi_gate: Optional[torch.Tensor] = None,
+    roi_threshold: float = 1e-4,
+) -> Dict[str, float]:
+    """DVF magnitude stats globally and, optionally, inside the ROI gate."""
+
+    magnitude = torch.sqrt(dvf.float().pow(2).sum(dim=1, keepdim=True) + 1e-6)
+    stats = {f"global_{key}": value for key, value in _summary_from_values(magnitude).items()}
+    if roi_gate is not None:
+        roi_mask = roi_gate.float() > roi_threshold
+        roi_values = magnitude[roi_mask.expand_as(magnitude)]
+        stats.update({f"roi_{key}": value for key, value in _summary_from_values(roi_values).items()})
+    return stats
+
+
+def jacobian_determinant(dvf: torch.Tensor) -> torch.Tensor:
+    """Compute forward-difference Jacobian determinant of `id + dvf`."""
+
+    if dvf.ndim != 5 or dvf.shape[1] != 3:
+        raise ValueError(f"Expected DVF shape (B,3,H,W,D), got {tuple(dvf.shape)}")
+    base = dvf[:, :, :-1, :-1, :-1]
+    du_dx = dvf[:, :, 1:, :-1, :-1] - base
+    du_dy = dvf[:, :, :-1, 1:, :-1] - base
+    du_dz = dvf[:, :, :-1, :-1, 1:] - base
+
+    j00 = 1.0 + du_dx[:, 0]
+    j01 = du_dy[:, 0]
+    j02 = du_dz[:, 0]
+    j10 = du_dx[:, 1]
+    j11 = 1.0 + du_dy[:, 1]
+    j12 = du_dz[:, 1]
+    j20 = du_dx[:, 2]
+    j21 = du_dy[:, 2]
+    j22 = 1.0 + du_dz[:, 2]
+
+    return (
+        j00 * (j11 * j22 - j12 * j21)
+        - j01 * (j10 * j22 - j12 * j20)
+        + j02 * (j10 * j21 - j11 * j20)
+    )
+
+
+def jacobian_stats(
+    dvf: torch.Tensor,
+    roi_gate: Optional[torch.Tensor] = None,
+    roi_threshold: float = 1e-4,
+) -> Dict[str, float]:
+    """Summarize folding and low-Jacobian behavior globally and inside ROI."""
+
+    jac = jacobian_determinant(dvf).detach().float()
+    flat = jac.flatten()
+    stats = {
+        "global_min": float(flat.min().cpu()),
+        "global_p01": float(torch.quantile(flat, q=0.01).cpu()),
+        "global_p05": float(torch.quantile(flat, q=0.05).cpu()),
+        "global_nonpos_ratio": float((flat <= 0).float().mean().cpu()),
+    }
+    if roi_gate is not None:
+        roi_inner = roi_gate[:, :, :-1, :-1, :-1] > roi_threshold
+        roi_values = jac[roi_inner[:, 0]]
+        if roi_values.numel() == 0:
+            stats.update(
+                {
+                    "roi_min": 0.0,
+                    "roi_p01": 0.0,
+                    "roi_p05": 0.0,
+                    "roi_nonpos_ratio": 0.0,
+                }
+            )
+        else:
+            stats.update(
+                {
+                    "roi_min": float(roi_values.min().cpu()),
+                    "roi_p01": float(torch.quantile(roi_values, q=0.01).cpu()),
+                    "roi_p05": float(torch.quantile(roi_values, q=0.05).cpu()),
+                    "roi_nonpos_ratio": float((roi_values <= 0).float().mean().cpu()),
+                }
+            )
+    return stats
+
+
+def label_dice(before: np.ndarray, fixed: np.ndarray, after: np.ndarray, label: int) -> Dict[str, float]:
+    """Before/after Dice for one integer label."""
+
+    before_mask = before == label
+    fixed_mask = fixed == label
+    after_mask = after == label
+    before_dice = (2.0 * np.logical_and(before_mask, fixed_mask).sum()) / (
+        before_mask.sum() + fixed_mask.sum() + 1e-5
+    )
+    after_dice = (2.0 * np.logical_and(after_mask, fixed_mask).sum()) / (
+        after_mask.sum() + fixed_mask.sum() + 1e-5
+    )
+    return {
+        "before": float(before_dice),
+        "after": float(after_dice),
+        "delta": float(after_dice - before_dice),
+    }
+
+
+def label_dice_table(
+    moving: np.ndarray,
+    fixed: np.ndarray,
+    stage2: np.ndarray,
+    final: np.ndarray,
+    labels: Sequence[int],
+) -> Dict[str, object]:
+    """Per-label Dice table comparing unregistered, Stage-2, and final masks."""
+
+    per_label = {}
+    stage2_values = []
+    final_values = []
+    deltas = []
+    for label in sorted(set(int(v) for v in labels if int(v) > 0)):
+        before_stage2 = label_dice(moving, fixed, stage2, label)
+        before_final = label_dice(moving, fixed, final, label)
+        entry = {
+            "before": before_stage2["before"],
+            "stage2": before_stage2["after"],
+            "final": before_final["after"],
+            "delta_final_vs_stage2": before_final["after"] - before_stage2["after"],
+        }
+        per_label[str(label)] = {key: float(value) for key, value in entry.items()}
+        stage2_values.append(entry["stage2"])
+        final_values.append(entry["final"])
+        deltas.append(entry["delta_final_vs_stage2"])
+
+    if not per_label:
+        return {
+            "labels": [],
+            "mean_stage2": 0.0,
+            "mean_final": 0.0,
+            "mean_delta": 0.0,
+            "median_delta": 0.0,
+            "worst_delta": 0.0,
+            "num_drop_gt_0_02": 0,
+            "num_drop_gt_0_05": 0,
+            "per_label": {},
+        }
+
+    stage2_arr = np.asarray(stage2_values, dtype=np.float64)
+    final_arr = np.asarray(final_values, dtype=np.float64)
+    delta_arr = np.asarray(deltas, dtype=np.float64)
+    return {
+        "labels": [int(label) for label in sorted(set(int(v) for v in labels if int(v) > 0))],
+        "mean_stage2": float(np.mean(stage2_arr)),
+        "mean_final": float(np.mean(final_arr)),
+        "mean_delta": float(np.mean(delta_arr)),
+        "median_delta": float(np.median(delta_arr)),
+        "worst_delta": float(np.min(delta_arr)),
+        "num_drop_gt_0_02": int(np.sum(delta_arr < -0.02)),
+        "num_drop_gt_0_05": int(np.sum(delta_arr < -0.05)),
+        "per_label": per_label,
+    }
+
+
+def split_present_labels(labels: Sequence[int], small_labels: Sequence[int]) -> Tuple[List[int], List[int]]:
+    """Split non-background labels into small-OAR and large/other labels."""
+
+    small = sorted(set(int(label) for label in small_labels if int(label) > 0))
+    small_set = set(small)
+    large = sorted(set(int(label) for label in labels if int(label) > 0 and int(label) not in small_set))
+    return small, large
 
 
 def make_stage3_inputs(

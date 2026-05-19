@@ -56,6 +56,15 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated SegRap small-OAR names used with metadata.",
     )
     parser.add_argument("--stage3-filters", default=None, help="Stage-3 filters. Default: checkpoint args or 8,16,32.")
+    parser.add_argument(
+        "--stage3-input-mode",
+        default=None,
+        choices=musa.utils_musa_plus.STAGE3_INPUT_MODES,
+        help=(
+            "Ablation/information policy. Default: checkpoint args or full. "
+            "Use no-fixed-small / no-fixed-seg to audit fixed-label leakage."
+        ),
+    )
     parser.add_argument("--roi-radius-min", type=int, default=None, help="Minimum ROI dilation radius.")
     parser.add_argument("--roi-radius-max", type=int, default=None, help="Maximum ROI dilation radius.")
     parser.add_argument("--roi-smooth-steps", type=int, default=None, help="ROI smoothing steps.")
@@ -119,7 +128,8 @@ def run_stage3(
     roi_smooth_steps: int,
     residual_scale_min: float,
     residual_scale_max: float,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    stage3_input_mode: str,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
     moving_oar = musa.utils_musa_plus.seg_to_foreground_mask(moving_seg_o_t)
     fixed_oar = musa.utils_musa_plus.seg_to_foreground_mask(fixed_seg_o_t)
     moving_small = musa.utils_musa_plus.seg_to_label_mask(moving_seg_o_t, small_oar_labels)
@@ -127,27 +137,39 @@ def run_stage3(
     moving_bone = (moving_seg_b_t > 0).float()
     fixed_bone = (fixed_seg_b_t > 0).float()
 
-    difficulty = musa.utils_musa_plus.estimate_pair_difficulty(
+    difficulty = musa.utils_musa_plus.estimate_pair_difficulty_by_mode(
+        input_mode=stage3_input_mode,
         moving=moving_t,
         fixed=fixed_t,
         moving_oar_mask=moving_oar,
         fixed_oar_mask=fixed_oar,
         moving_bone_mask=moving_bone,
         fixed_bone_mask=fixed_bone,
+        deformed_stage2=deformed_stage2_t,
+        dvf_stage2=dvf_stage2_t,
     )
     warped_small_stage2 = transformer(moving_small, dvf_stage2_t, mode="bilinear").clamp(0.0, 1.0)
     warped_bone_stage2 = transformer(moving_bone, dvf_stage2_t, mode="bilinear").clamp(0.0, 1.0)
 
-    roi_source = torch.maximum(fixed_small, warped_small_stage2)
+    conditioning = musa.utils_musa_plus.stage3_conditioning_masks(
+        input_mode=stage3_input_mode,
+        fixed_small_mask=fixed_small,
+        warped_small_mask_stage2=warped_small_stage2,
+        fixed_bone_mask=fixed_bone,
+    )
     roi_radius = musa.utils_musa_plus.difficulty_to_radius(difficulty, roi_radius_min, roi_radius_max)
-    roi_gate = musa.utils_musa_plus.build_roi_gate(roi_source, radius=roi_radius, smooth_steps=roi_smooth_steps)
+    roi_gate = musa.utils_musa_plus.build_roi_gate(
+        conditioning["roi_source"],
+        radius=roi_radius,
+        smooth_steps=roi_smooth_steps,
+    )
     stage3_inputs = musa.utils_musa_plus.make_stage3_inputs(
         fixed=fixed_t,
         deformed_stage2=deformed_stage2_t,
-        fixed_small_mask=fixed_small,
+        fixed_small_mask=conditioning["fixed_small_feature"],
         warped_small_mask_stage2=warped_small_stage2,
         dvf_stage2=dvf_stage2_t,
-        fixed_bone_mask=fixed_bone,
+        fixed_bone_mask=conditioning["fixed_bone_feature"],
         warped_bone_mask_stage2=warped_bone_stage2,
     )
 
@@ -164,15 +186,19 @@ def run_stage3(
 
     small_stage2_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_small_stage2, fixed_small).mean()
     small_final_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_small_final, fixed_small).mean()
-    residual_mag = torch.sqrt(gated_local_dvf.pow(2).sum(dim=1) + 1e-6).mean()
     metrics = {
+        "input_mode": stage3_input_mode,
         "difficulty": float(difficulty.mean().detach().cpu()),
         "roi_radius": float(roi_radius),
         "residual_scale": float(residual_scale.mean().detach().cpu()),
         "small_stage2_dice": float(small_stage2_dice.detach().cpu()),
         "small_final_dice": float(small_final_dice.detach().cpu()),
         "small_delta": float((small_final_dice - small_stage2_dice).detach().cpu()),
-        "residual_mag_mean": float(residual_mag.detach().cpu()),
+        "residual_magnitude": musa.utils_musa_plus.magnitude_stats(gated_local_dvf, roi_gate),
+        "stage2_dvf_magnitude": musa.utils_musa_plus.magnitude_stats(dvf_stage2_t, roi_gate),
+        "final_dvf_magnitude": musa.utils_musa_plus.magnitude_stats(dvf_final_t, roi_gate),
+        "stage2_jacobian": musa.utils_musa_plus.jacobian_stats(dvf_stage2_t, roi_gate),
+        "final_jacobian": musa.utils_musa_plus.jacobian_stats(dvf_final_t, roi_gate),
     }
     return deformed_final_t, dvf_final_t, metrics
 
@@ -230,6 +256,12 @@ def main() -> None:
     roi_smooth_steps = int(resolve_option(args, stage3_payload, "roi_smooth_steps", 2))
     residual_scale_min = float(resolve_option(args, stage3_payload, "residual_scale_min", 0.25))
     residual_scale_max = float(resolve_option(args, stage3_payload, "residual_scale_max", 1.0))
+    stage3_input_mode = str(resolve_option(args, stage3_payload, "stage3_input_mode", "full"))
+    if stage3_input_mode not in musa.utils_musa_plus.STAGE3_INPUT_MODES:
+        raise ValueError(
+            f"Unsupported --stage3-input-mode {stage3_input_mode!r}; "
+            f"choices={musa.utils_musa_plus.STAGE3_INPUT_MODES}"
+        )
 
     moving_np = load_array(npy_path(data_root, "images", args.moving_id), RESOLUTION_SHAPES["r1"]).astype(np.float32)
     fixed_np = load_array(npy_path(data_root, "images", args.fixed_id), RESOLUTION_SHAPES["r1"]).astype(np.float32)
@@ -277,6 +309,7 @@ def main() -> None:
             roi_smooth_steps=roi_smooth_steps,
             residual_scale_min=residual_scale_min,
             residual_scale_max=residual_scale_max,
+            stage3_input_mode=stage3_input_mode,
         )
 
     deformed_final_np = musa.utils_basics.torch2numpy(deformed_final_t, CHECK=True)
@@ -289,6 +322,14 @@ def main() -> None:
     warped_seg_b_stage2 = warp_segmentation(moving_seg_b, dvf_stage2_t, transformer, device)
     warped_seg_o_final = warp_segmentation(moving_seg_o, dvf_final_t, transformer, device)
     warped_seg_b_final = warp_segmentation(moving_seg_b, dvf_final_t, transformer, device)
+    oar_present = np.union1d(np.unique(moving_seg_o), np.unique(fixed_seg_o))
+    oar_present = np.union1d(oar_present, np.unique(warped_seg_o_stage2))
+    oar_present = np.union1d(oar_present, np.unique(warped_seg_o_final)).astype(np.int64)
+    small_present, large_present = musa.utils_musa_plus.split_present_labels(oar_present, small_oar_labels)
+    bone_present = np.union1d(np.unique(moving_seg_b), np.unique(fixed_seg_b))
+    bone_present = np.union1d(bone_present, np.unique(warped_seg_b_stage2))
+    bone_present = np.union1d(bone_present, np.unique(warped_seg_b_final)).astype(np.int64)
+    bone_present = [int(label) for label in bone_present if int(label) > 0]
 
     metrics: Dict[str, object] = {
         "moving_id": args.moving_id,
@@ -298,11 +339,40 @@ def main() -> None:
         "checkpoint_stage2": args.checkpoint_stage2,
         "checkpoint_stage3": args.checkpoint_stage3,
         "small_oar_labels": [int(label) for label in small_oar_labels],
+        "stage3_input_mode": stage3_input_mode,
+        "leakage_audit": {
+            "uses_fixed_small_mask_as_input": stage3_input_mode == "full",
+            "uses_fixed_small_mask_for_roi": stage3_input_mode == "full",
+            "uses_fixed_bone_mask_as_input": stage3_input_mode in ("full", "no-fixed-small"),
+            "uses_fixed_segmentation_for_difficulty": stage3_input_mode in ("full", "no-fixed-small"),
+            "uses_fixed_segmentation_for_metrics": True,
+        },
         "stage3": stage3_metrics,
         "dice_seg_o_stage2": dice_for_labels(moving_seg_o, fixed_seg_o, warped_seg_o_stage2),
         "dice_seg_b_stage2": dice_for_labels(moving_seg_b, fixed_seg_b, warped_seg_b_stage2),
         "dice_seg_o_musa_plus": dice_for_labels(moving_seg_o, fixed_seg_o, warped_seg_o_final),
         "dice_seg_b_musa_plus": dice_for_labels(moving_seg_b, fixed_seg_b, warped_seg_b_final),
+        "small_oar_per_label": musa.utils_musa_plus.label_dice_table(
+            moving_seg_o,
+            fixed_seg_o,
+            warped_seg_o_stage2,
+            warped_seg_o_final,
+            small_present,
+        ),
+        "large_oar_per_label": musa.utils_musa_plus.label_dice_table(
+            moving_seg_o,
+            fixed_seg_o,
+            warped_seg_o_stage2,
+            warped_seg_o_final,
+            large_present,
+        ),
+        "bone_per_label": musa.utils_musa_plus.label_dice_table(
+            moving_seg_b,
+            fixed_seg_b,
+            warped_seg_b_stage2,
+            warped_seg_b_final,
+            bone_present,
+        ),
     }
 
     save_musa_plus_outputs(
@@ -325,6 +395,17 @@ def main() -> None:
         "[INFO] small-OAR Dice "
         f"{stage3_metrics['small_stage2_dice']:.6f} -> {stage3_metrics['small_final_dice']:.6f} "
         f"({stage3_metrics['small_delta']:+.6f})"
+    )
+    print(
+        "[INFO] small-OAR per-label mean "
+        f"{metrics['small_oar_per_label']['mean_stage2']:.6f} -> "
+        f"{metrics['small_oar_per_label']['mean_final']:.6f} "
+        f"({metrics['small_oar_per_label']['mean_delta']:+.6f})"
+    )
+    print(
+        "[INFO] final Jacobian non-positive ratio "
+        f"global={stage3_metrics['final_jacobian']['global_nonpos_ratio']:.6e}, "
+        f"roi={stage3_metrics['final_jacobian']['roi_nonpos_ratio']:.6e}"
     )
     print(f"[INFO] Metrics: {output_dir / f'{prefix}_musa_plus_metrics.json'}")
 

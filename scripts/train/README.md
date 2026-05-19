@@ -30,6 +30,12 @@ This is the Phase-1 low-risk prototype from `docs/musa_plus_research_plan.md`. I
 - difficulty-adaptive ROI dilation, small-OAR loss weight, residual scale, and smoothness;
 - rule-based anatomy-conditioned regularization maps for bone, small-OAR ROI, and ROI boundary.
 
+The Stage-3 information policy is controlled by `--stage3-input-mode`:
+
+- `full`: current segmentation-guided prototype, using fixed small-OAR and fixed bone masks.
+- `no-fixed-small`: zeros the fixed small-OAR channel and builds ROI from the Stage-2 warped moving small-OAR mask.
+- `no-fixed-seg`: zeros fixed small-OAR and fixed bone channels, builds ROI from warped moving small-OAR, and uses CT/flow-only difficulty.
+
 Example:
 
 ```bash
@@ -46,7 +52,8 @@ python scripts/train/train_musa_plus_stage3.py \
   --out-dir runs/musa_plus_stage3_m05 \
   --batch-size 1 \
   --epochs 200 \
-  --steps-per-epoch 100
+  --steps-per-epoch 100 \
+  --stage3-input-mode full
 ```
 
 If metadata is unavailable, pass explicit labels:
@@ -67,4 +74,38 @@ python scripts/infer/infer_musa_plus_prepared_pair.py \
   --checkpoint-stage2 /path/to/m05_stage2_r1.pth \
   --checkpoint-stage3 runs/musa_plus_stage3_m05/best_stage3.pth \
   --output-dir runs/musa_plus_stage3_m05/infer_pair
+```
+
+For leakage ablation with an existing checkpoint, rerun inference with:
+
+```bash
+--stage3-input-mode no-fixed-small
+```
+
+or the stricter:
+
+```bash
+--stage3-input-mode no-fixed-seg
+```
+
+The MUSA+ metrics JSON reports:
+
+- `leakage_audit`: whether fixed labels were used as Stage-3 input, ROI source, or difficulty features.
+- `small_oar_per_label`: integer-label small-OAR Dice, not just binary soft Dice.
+- `large_oar_per_label` and `bone_per_label`: worst label drop and counts of drops larger than 0.02 / 0.05.
+- `stage3.residual_magnitude`: global and ROI mean/p95/max residual magnitude.
+- `stage3.final_jacobian`: global and ROI Jacobian minimum, low percentiles, and non-positive ratio.
+
+Run the whole validation pair CSV:
+
+```bash
+python scripts/infer/eval_musa_plus_prepared_pairs.py \
+  --pairs-csv data/lists/val_pairs.csv \
+  --data-root data \
+  --model-type 05dualprnet-v1 \
+  --checkpoint-stage1 /path/to/m05_stage1_musa_r2.pth \
+  --checkpoint-stage2 /path/to/m05_stage2_r1.pth \
+  --checkpoint-stage3 runs/musa_plus_stage3_m05/best_stage3.pth \
+  --output-dir runs/musa_plus_stage3_m05/eval_full \
+  --stage3-input-mode full
 ```
