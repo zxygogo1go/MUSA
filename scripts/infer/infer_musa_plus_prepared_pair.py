@@ -130,26 +130,32 @@ def run_stage3(
     residual_scale_max: float,
     stage3_input_mode: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
-    moving_oar = musa.utils_musa_plus.seg_to_foreground_mask(moving_seg_o_t)
-    fixed_oar = musa.utils_musa_plus.seg_to_foreground_mask(fixed_seg_o_t)
     moving_small = musa.utils_musa_plus.seg_to_label_mask(moving_seg_o_t, small_oar_labels)
     fixed_small = musa.utils_musa_plus.seg_to_label_mask(fixed_seg_o_t, small_oar_labels)
     moving_bone = (moving_seg_b_t > 0).float()
     fixed_bone = (fixed_seg_b_t > 0).float()
 
-    difficulty = musa.utils_musa_plus.estimate_pair_difficulty_by_mode(
-        input_mode=stage3_input_mode,
-        moving=moving_t,
-        fixed=fixed_t,
-        moving_oar_mask=moving_oar,
-        fixed_oar_mask=fixed_oar,
-        moving_bone_mask=moving_bone,
-        fixed_bone_mask=fixed_bone,
-        deformed_stage2=deformed_stage2_t,
-        dvf_stage2=dvf_stage2_t,
-    )
     warped_small_stage2 = transformer(moving_small, dvf_stage2_t, mode="bilinear").clamp(0.0, 1.0)
     warped_bone_stage2 = transformer(moving_bone, dvf_stage2_t, mode="bilinear").clamp(0.0, 1.0)
+    if stage3_input_mode == "no-fixed-seg":
+        difficulty = musa.utils_musa_plus.estimate_pair_difficulty_ct_only(
+            moving=moving_t,
+            fixed=fixed_t,
+            deformed_stage2=deformed_stage2_t,
+            dvf_stage2=dvf_stage2_t,
+        )
+    else:
+        stage2_small_roi = torch.maximum(fixed_small, warped_small_stage2.detach())
+        difficulty = musa.utils_musa_plus.estimate_stage2_pair_difficulty(
+            fixed=fixed_t,
+            deformed_stage2=deformed_stage2_t,
+            dvf_stage2=dvf_stage2_t,
+            warped_small_mask_stage2=warped_small_stage2,
+            fixed_small_mask=fixed_small,
+            warped_bone_mask_stage2=warped_bone_stage2,
+            fixed_bone_mask=fixed_bone,
+            image_mask=stage2_small_roi,
+        )
 
     conditioning = musa.utils_musa_plus.stage3_conditioning_masks(
         input_mode=stage3_input_mode,
@@ -157,10 +163,10 @@ def run_stage3(
         warped_small_mask_stage2=warped_small_stage2,
         fixed_bone_mask=fixed_bone,
     )
-    roi_radius = musa.utils_musa_plus.difficulty_to_radius(difficulty, roi_radius_min, roi_radius_max)
-    roi_gate = musa.utils_musa_plus.build_roi_gate(
+    roi_radius = musa.utils_musa_plus.difficulty_to_radius_per_batch(difficulty, roi_radius_min, roi_radius_max)
+    roi_gate = musa.utils_musa_plus.build_roi_gate_per_batch(
         conditioning["roi_source"],
-        radius=roi_radius,
+        radii=roi_radius,
         smooth_steps=roi_smooth_steps,
     )
     stage3_inputs = musa.utils_musa_plus.make_stage3_inputs(
@@ -189,7 +195,7 @@ def run_stage3(
     metrics = {
         "input_mode": stage3_input_mode,
         "difficulty": float(difficulty.mean().detach().cpu()),
-        "roi_radius": float(roi_radius),
+        "roi_radius": float(roi_radius.float().mean().detach().cpu()),
         "residual_scale": float(residual_scale.mean().detach().cpu()),
         "small_stage2_dice": float(small_stage2_dice.detach().cpu()),
         "small_final_dice": float(small_final_dice.detach().cpu()),

@@ -77,6 +77,12 @@ class SmokeTests(unittest.TestCase):
         self.assertTrue(torch.all(gate >= 0))
         self.assertTrue(torch.all(gate <= 1))
 
+        batch_mask = torch.cat((mask, mask), dim=0)
+        batch_gate = musa.utils_musa_plus.build_roi_gate_per_batch(batch_mask, torch.tensor([0, 1]), smooth_steps=0)
+        self.assertEqual(tuple(batch_gate.shape), tuple(batch_mask.shape))
+        self.assertAlmostEqual(float(batch_gate[0].sum()), float(mask.sum()))
+        self.assertGreater(float(batch_gate[1].sum()), float(mask.sum()))
+
         moving = torch.zeros(1, 1, 3, 3, 3)
         fixed = moving.clone()
         difficulty = musa.utils_musa_plus.estimate_pair_difficulty(
@@ -88,6 +94,25 @@ class SmokeTests(unittest.TestCase):
             fixed_bone_mask=mask,
         )
         self.assertTrue(torch.allclose(difficulty, torch.zeros_like(difficulty)))
+
+        stage2_difficulty = musa.utils_musa_plus.estimate_stage2_pair_difficulty(
+            fixed=fixed,
+            deformed_stage2=fixed,
+            dvf_stage2=torch.zeros(1, 3, 3, 3, 3),
+            warped_small_mask_stage2=mask,
+            fixed_small_mask=mask,
+            warped_bone_mask_stage2=mask,
+            fixed_bone_mask=mask,
+            image_mask=mask,
+        )
+        self.assertTrue(torch.allclose(stage2_difficulty, torch.zeros_like(stage2_difficulty)))
+
+        loss_per_batch = musa.utils_musa_plus.masked_mse_loss_per_batch(
+            pred=torch.zeros(2, 1, 3, 3, 3),
+            target=torch.ones(2, 1, 3, 3, 3),
+            mask=batch_mask,
+        )
+        self.assertEqual(tuple(loss_per_batch.shape), (2,))
 
     def test_musa_plus_local_residual_unet_shape(self):
         from musa.registration_models.musa_plus import LocalResidualUNet

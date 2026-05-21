@@ -26,8 +26,8 @@
 
 This is the Phase-1 low-risk prototype from `docs/musa_plus_research_plan.md`. It uses:
 
-- rule-based pair difficulty from initial bone Dice, OAR Dice, and image MSE;
-- difficulty-adaptive ROI dilation, small-OAR loss weight, residual scale, and smoothness;
+- rule-based pair difficulty from Stage-2 residual small-OAR Dice, bone Dice, local image MSE, and flow magnitude;
+- per-pair difficulty-adaptive ROI dilation, small-OAR loss weight, residual scale, and smoothness;
 - rule-based anatomy-conditioned regularization maps for bone, small-OAR ROI, and ROI boundary.
 
 The Stage-3 information policy is controlled by `--stage3-input-mode`:

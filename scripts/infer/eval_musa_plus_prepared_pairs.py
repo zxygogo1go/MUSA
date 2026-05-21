@@ -214,6 +214,9 @@ def row_from_metrics(metrics: Dict[str, object]) -> Dict[str, object]:
     return {
         "moving_id": metrics["moving_id"],
         "fixed_id": metrics["fixed_id"],
+        "difficulty": stage3["difficulty"],
+        "roi_radius": stage3["roi_radius"],
+        "residual_scale": stage3["residual_scale"],
         "small_soft_stage2": stage3["small_stage2_dice"],
         "small_soft_final": stage3["small_final_dice"],
         "small_soft_delta": stage3["small_delta"],
@@ -252,6 +255,29 @@ def summarize(rows: List[Dict[str, object]]) -> Dict[str, object]:
         summary[f"{key}_mean"] = float(np.nanmean(values))
         summary[f"{key}_std"] = float(np.nanstd(values))
     return summary
+
+
+def summarize_by_difficulty(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    """Summarize easy/medium/hard pair buckets using the adaptive difficulty score."""
+
+    if not rows:
+        return {}
+    values = np.asarray([float(row["difficulty"]) for row in rows], dtype=np.float64)
+    q_easy, q_hard = np.quantile(values, [1.0 / 3.0, 2.0 / 3.0])
+    buckets = {
+        "easy": [row for row in rows if float(row["difficulty"]) <= q_easy],
+        "medium": [row for row in rows if q_easy < float(row["difficulty"]) <= q_hard],
+        "hard": [row for row in rows if float(row["difficulty"]) > q_hard],
+    }
+    return {
+        name: {
+            "difficulty_min": float(min(float(row["difficulty"]) for row in bucket)),
+            "difficulty_max": float(max(float(row["difficulty"]) for row in bucket)),
+            **summarize(bucket),
+        }
+        for name, bucket in buckets.items()
+        if bucket
+    }
 
 
 def main() -> None:
@@ -316,6 +342,7 @@ def main() -> None:
         all_metrics.append(metrics)
         print(
             "[INFO] "
+            f"difficulty {row['difficulty']:.3f}, roi {row['roi_radius']:.1f}; "
             f"small-label {row['small_label_stage2']:.4f}->{row['small_label_final']:.4f} "
             f"({row['small_label_delta']:+.4f}); "
             f"large worst {row['large_label_worst_delta']:+.4f}; "
@@ -329,8 +356,10 @@ def main() -> None:
             pair_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     summary = summarize(rows)
+    difficulty_buckets = summarize_by_difficulty(rows)
     payload = {
         "summary": summary,
+        "difficulty_buckets": difficulty_buckets,
         "checkpoint_stage1": args.checkpoint_stage1,
         "checkpoint_stage2": args.checkpoint_stage2,
         "checkpoint_stage3": args.checkpoint_stage3,

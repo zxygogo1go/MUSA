@@ -308,31 +308,39 @@ def stage3_forward(
     warped_large_stage2 = spatial_transformer_r1(moving_large, dvf_stage2, mode="bilinear").clamp(0.0, 1.0)
     warped_bone_stage2 = spatial_transformer_r1(moving_bone, dvf_stage2, mode="bilinear").clamp(0.0, 1.0)
 
-    difficulty = musa.utils_musa_plus.estimate_pair_difficulty_by_mode(
-        input_mode=args.stage3_input_mode,
-        moving=moving,
-        fixed=fixed,
-        moving_oar_mask=moving_oar,
-        fixed_oar_mask=fixed_oar,
-        moving_bone_mask=moving_bone,
-        fixed_bone_mask=fixed_bone,
-        deformed_stage2=deformed_stage2,
-        dvf_stage2=dvf_stage2,
-    )
     conditioning = musa.utils_musa_plus.stage3_conditioning_masks(
         input_mode=args.stage3_input_mode,
         fixed_small_mask=fixed_small,
         warped_small_mask_stage2=warped_small_stage2,
         fixed_bone_mask=fixed_bone,
     )
-    roi_radius = musa.utils_musa_plus.difficulty_to_radius(
+    if args.stage3_input_mode == "no-fixed-seg":
+        difficulty = musa.utils_musa_plus.estimate_pair_difficulty_ct_only(
+            moving=moving,
+            fixed=fixed,
+            deformed_stage2=deformed_stage2,
+            dvf_stage2=dvf_stage2,
+        )
+    else:
+        stage2_small_roi = torch.maximum(fixed_small, warped_small_stage2.detach())
+        difficulty = musa.utils_musa_plus.estimate_stage2_pair_difficulty(
+            fixed=fixed,
+            deformed_stage2=deformed_stage2,
+            dvf_stage2=dvf_stage2,
+            warped_small_mask_stage2=warped_small_stage2,
+            fixed_small_mask=fixed_small,
+            warped_bone_mask_stage2=warped_bone_stage2,
+            fixed_bone_mask=fixed_bone,
+            image_mask=stage2_small_roi,
+        )
+    roi_radius = musa.utils_musa_plus.difficulty_to_radius_per_batch(
         difficulty,
         radius_min=args.roi_radius_min,
         radius_max=args.roi_radius_max,
     )
-    roi_gate = musa.utils_musa_plus.build_roi_gate(
+    roi_gate = musa.utils_musa_plus.build_roi_gate_per_batch(
         conditioning["roi_source"],
-        radius=roi_radius,
+        radii=roi_radius,
         smooth_steps=args.roi_smooth_steps,
     )
 
@@ -370,24 +378,38 @@ def stage3_forward(
         difficulty,
         args.lambda_small_min,
         args.lambda_small_max,
-    ).mean()
-    lambda_smooth = args.lambda_smooth + args.lambda_smooth_extra * float(difficulty.mean().detach().cpu())
-
-    loss_local_img = musa.utils_musa_plus.masked_mse_loss(deformed_final, fixed, roi_gate)
-    loss_small = musa.utils_musa_plus.binary_dice_loss(warped_small_final, fixed_small)
-    loss_smooth = musa.utils_musa_plus.weighted_gradient_loss(gated_local_dvf, anatomy_maps["smooth"])
-    loss_mag = musa.utils_musa_plus.weighted_magnitude_loss(local_dvf, anatomy_maps["magnitude"])
-    loss_preserve_large = musa.utils_musa_plus.binary_dice_loss(warped_large_final, warped_large_stage2.detach())
-    loss_preserve_bone = musa.utils_musa_plus.binary_dice_loss(warped_bone_final, warped_bone_stage2.detach())
-
-    loss = (
-        args.lambda_local_img * loss_local_img
-        + lambda_small * loss_small
-        + lambda_smooth * loss_smooth
-        + args.lambda_mag * loss_mag
-        + args.lambda_preserve_large * loss_preserve_large
-        + args.lambda_preserve_bone * loss_preserve_bone
     )
+    lambda_smooth = args.lambda_smooth + args.lambda_smooth_extra * difficulty
+
+    loss_local_img_per_pair = musa.utils_musa_plus.masked_mse_loss_per_batch(deformed_final, fixed, roi_gate)
+    loss_small_per_pair = musa.utils_musa_plus.binary_dice_loss_per_batch(warped_small_final, fixed_small)
+    loss_smooth_per_pair = musa.utils_musa_plus.weighted_gradient_loss_per_batch(gated_local_dvf, anatomy_maps["smooth"])
+    loss_mag_per_pair = musa.utils_musa_plus.weighted_magnitude_loss_per_batch(local_dvf, anatomy_maps["magnitude"])
+    loss_preserve_large_per_pair = musa.utils_musa_plus.binary_dice_loss_per_batch(
+        warped_large_final,
+        warped_large_stage2.detach(),
+    )
+    loss_preserve_bone_per_pair = musa.utils_musa_plus.binary_dice_loss_per_batch(
+        warped_bone_final,
+        warped_bone_stage2.detach(),
+    )
+
+    loss_per_pair = (
+        args.lambda_local_img * loss_local_img_per_pair
+        + lambda_small * loss_small_per_pair
+        + lambda_smooth * loss_smooth_per_pair
+        + args.lambda_mag * loss_mag_per_pair
+        + args.lambda_preserve_large * loss_preserve_large_per_pair
+        + args.lambda_preserve_bone * loss_preserve_bone_per_pair
+    )
+    loss = loss_per_pair.mean()
+
+    loss_local_img = loss_local_img_per_pair.mean()
+    loss_small = loss_small_per_pair.mean()
+    loss_smooth = loss_smooth_per_pair.mean()
+    loss_mag = loss_mag_per_pair.mean()
+    loss_preserve_large = loss_preserve_large_per_pair.mean()
+    loss_preserve_bone = loss_preserve_bone_per_pair.mean()
 
     with torch.no_grad():
         small_stage2_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_small_stage2, fixed_small).mean()
@@ -421,8 +443,12 @@ def stage3_forward(
         "loss_preserve_large": float(loss_preserve_large.detach().cpu()),
         "loss_preserve_bone": float(loss_preserve_bone.detach().cpu()),
         "difficulty": float(difficulty.mean().detach().cpu()),
-        "roi_radius": float(roi_radius),
-        "lambda_small": float(lambda_small.detach().cpu()),
+        "roi_radius": float(roi_radius.float().mean().detach().cpu()),
+        "roi_radius_min": float(roi_radius.float().min().detach().cpu()),
+        "roi_radius_max": float(roi_radius.float().max().detach().cpu()),
+        "residual_scale": float(residual_scale.mean().detach().cpu()),
+        "lambda_small": float(lambda_small.mean().detach().cpu()),
+        "lambda_smooth": float(lambda_smooth.mean().detach().cpu()),
         "small_stage2_dice": float(small_stage2_dice.detach().cpu()),
         "small_final_dice": float(small_final_dice.detach().cpu()),
         "small_delta": float((small_final_dice - small_stage2_dice).detach().cpu()),
