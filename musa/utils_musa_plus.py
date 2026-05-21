@@ -191,7 +191,7 @@ def estimate_pair_difficulty_ct_only(
     if dvf_stage2 is None:
         flow_score = torch.zeros_like(initial_mse)
     else:
-        flow_mag = torch.sqrt(dvf_stage2.float().pow(2).sum(dim=1) + 1e-6).flatten(1)
+        flow_mag = torch.sqrt(dvf_stage2.float().pow(2).sum(dim=1)).flatten(1)
         flow_score = (torch.quantile(flow_mag, q=0.95, dim=1) / 20.0).clamp(0.0, 1.0)
 
     w_initial, w_stage2, w_flow = weights
@@ -226,7 +226,7 @@ def estimate_stage2_pair_difficulty(
         image_residual = masked_mse_loss_per_batch(deformed_stage2, fixed, image_mask)
     image_residual = image_residual.clamp(0.0, 1.0)
 
-    flow_mag = torch.sqrt(dvf_stage2.float().pow(2).sum(dim=1) + 1e-6).flatten(1)
+    flow_mag = torch.sqrt(dvf_stage2.float().pow(2).sum(dim=1)).flatten(1)
     flow_score = (torch.quantile(flow_mag, q=0.95, dim=1) / max(flow_scale, 1e-6)).clamp(0.0, 1.0)
 
     w_small, w_bone, w_img, w_flow = weights
