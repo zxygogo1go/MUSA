@@ -114,6 +114,13 @@ class SmokeTests(unittest.TestCase):
         )
         self.assertEqual(tuple(loss_per_batch.shape), (2,))
 
+        jac_loss = musa.utils_musa_plus.jacobian_hinge_loss_per_batch(
+            torch.zeros(2, 3, 3, 3, 3),
+            roi_gate=batch_mask,
+        )
+        self.assertEqual(tuple(jac_loss.shape), (2,))
+        self.assertTrue(torch.allclose(jac_loss, torch.zeros_like(jac_loss)))
+
     def test_musa_plus_local_residual_unet_shape(self):
         from musa.registration_models.musa_plus import LocalResidualUNet
 
