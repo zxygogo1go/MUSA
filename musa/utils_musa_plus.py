@@ -532,6 +532,46 @@ def jacobian_determinant(dvf: torch.Tensor) -> torch.Tensor:
     )
 
 
+def jacobian_hinge_loss_per_batch(
+    dvf: torch.Tensor,
+    roi_gate: Optional[torch.Tensor] = None,
+    margin: float = 0.05,
+    roi_weight: float = 5.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Penalize low or non-positive Jacobian determinants for each batch item."""
+
+    jac = jacobian_determinant(dvf)
+    penalty = F.relu(float(margin) - jac).pow(2).unsqueeze(1)
+    global_loss = penalty.flatten(1).mean(dim=1)
+    if roi_gate is None:
+        return global_loss
+
+    roi_inner = (roi_gate[:, :, :-1, :-1, :-1] > 1e-4).float()
+    roi_numerator = (penalty * roi_inner).flatten(1).sum(dim=1)
+    roi_denominator = roi_inner.flatten(1).sum(dim=1).clamp_min(eps)
+    roi_loss = roi_numerator / roi_denominator
+    return global_loss + float(roi_weight) * roi_loss
+
+
+def jacobian_hinge_loss(
+    dvf: torch.Tensor,
+    roi_gate: Optional[torch.Tensor] = None,
+    margin: float = 0.05,
+    roi_weight: float = 5.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Mean low-Jacobian hinge loss."""
+
+    return jacobian_hinge_loss_per_batch(
+        dvf=dvf,
+        roi_gate=roi_gate,
+        margin=margin,
+        roi_weight=roi_weight,
+        eps=eps,
+    ).mean()
+
+
 def jacobian_stats(
     dvf: torch.Tensor,
     roi_gate: Optional[torch.Tensor] = None,

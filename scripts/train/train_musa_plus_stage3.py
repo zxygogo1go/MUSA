@@ -121,6 +121,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-smooth", type=float, default=0.10, help="Base weighted smoothness weight.")
     parser.add_argument("--lambda-smooth-extra", type=float, default=0.20, help="Extra smoothness weight at difficulty=1.")
     parser.add_argument("--lambda-mag", type=float, default=0.01, help="Weighted residual magnitude penalty.")
+    parser.add_argument("--lambda-jacobian", type=float, default=0.0, help="Low-Jacobian/folding penalty weight.")
+    parser.add_argument("--jacobian-margin", type=float, default=0.05, help="Minimum desired Jacobian determinant margin.")
+    parser.add_argument("--jacobian-roi-weight", type=float, default=5.0, help="Extra Jacobian penalty weight inside ROI.")
     parser.add_argument("--lambda-preserve-large", type=float, default=0.50, help="Large-OAR preservation weight.")
     parser.add_argument("--lambda-preserve-bone", type=float, default=0.50, help="Bone preservation weight.")
     parser.add_argument(
@@ -385,6 +388,12 @@ def stage3_forward(
     loss_small_per_pair = musa.utils_musa_plus.binary_dice_loss_per_batch(warped_small_final, fixed_small)
     loss_smooth_per_pair = musa.utils_musa_plus.weighted_gradient_loss_per_batch(gated_local_dvf, anatomy_maps["smooth"])
     loss_mag_per_pair = musa.utils_musa_plus.weighted_magnitude_loss_per_batch(local_dvf, anatomy_maps["magnitude"])
+    loss_jacobian_per_pair = musa.utils_musa_plus.jacobian_hinge_loss_per_batch(
+        dvf_final,
+        roi_gate=roi_gate,
+        margin=args.jacobian_margin,
+        roi_weight=args.jacobian_roi_weight,
+    )
     loss_preserve_large_per_pair = musa.utils_musa_plus.binary_dice_loss_per_batch(
         warped_large_final,
         warped_large_stage2.detach(),
@@ -399,6 +408,7 @@ def stage3_forward(
         + lambda_small * loss_small_per_pair
         + lambda_smooth * loss_smooth_per_pair
         + args.lambda_mag * loss_mag_per_pair
+        + args.lambda_jacobian * loss_jacobian_per_pair
         + args.lambda_preserve_large * loss_preserve_large_per_pair
         + args.lambda_preserve_bone * loss_preserve_bone_per_pair
     )
@@ -408,6 +418,7 @@ def stage3_forward(
     loss_small = loss_small_per_pair.mean()
     loss_smooth = loss_smooth_per_pair.mean()
     loss_mag = loss_mag_per_pair.mean()
+    loss_jacobian = loss_jacobian_per_pair.mean()
     loss_preserve_large = loss_preserve_large_per_pair.mean()
     loss_preserve_bone = loss_preserve_bone_per_pair.mean()
 
@@ -440,6 +451,7 @@ def stage3_forward(
         "loss_small": float(loss_small.detach().cpu()),
         "loss_smooth": float(loss_smooth.detach().cpu()),
         "loss_mag": float(loss_mag.detach().cpu()),
+        "loss_jacobian": float(loss_jacobian.detach().cpu()),
         "loss_preserve_large": float(loss_preserve_large.detach().cpu()),
         "loss_preserve_bone": float(loss_preserve_bone.detach().cpu()),
         "difficulty": float(difficulty.mean().detach().cpu()),
