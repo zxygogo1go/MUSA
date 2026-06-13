@@ -109,6 +109,40 @@ python scripts/preprocess/prepare_segrap_case.py \
 If you need bone labels to also appear in `seg_o`, add
 `--include-bone-in-seg-o`.
 
+## Prepare HaN-Seg Cases
+
+For the public HaN-Seg layout:
+
+```text
+HaN-Seg/set_1/case_01/
+  case_01_IMG_CT.nrrd
+  case_01_IMG_MR_T1.nrrd
+  case_01_OAR_Cochlea_L.seg.nrrd
+  ...
+```
+
+prepare all CT cases with:
+
+```bash
+python scripts/preprocess/prepare_hanseg_batch.py \
+  --cases-root HaN-Seg/set_1 \
+  --out-root data_hanseg \
+  --write-paper-split
+```
+
+The HaN-Seg helper reads NRRD files directly and writes case IDs as
+`hanseg_0001`, `hanseg_0002`, ... by default. It uses a fixed global OAR label
+map, so a missing structure in one case does not shift labels in later organs.
+By default, `OAR_Bone_Mandible` is excluded from `seg_o` and used as binary
+`seg_b`.
+
+Validate the prepared arrays before training:
+
+```bash
+python scripts/preprocess/validate_prepared_data.py \
+  --data-root data_hanseg
+```
+
 ## Make Train/Validation Lists
 
 After saving preprocessed arrays to `data/images/*.npy`, validate the prepared

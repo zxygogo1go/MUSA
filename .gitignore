@@ -67,6 +67,11 @@ save_model_pt/
 # Dataset
 # =========================
 data/
+HaN-Seg/
+data_hanseg/images/
+data_hanseg/seg_o/
+data_hanseg/seg_b/
+data_hanseg/metadata/
 dataset/
 datasets/
 cache/
@@ -77,6 +82,7 @@ temp/
 # Outputs / Results
 # =========================
 outputs/
+outputs_hanseg/
 output/
 results/
 visualization/
