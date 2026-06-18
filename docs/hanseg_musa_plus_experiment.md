@@ -168,3 +168,37 @@ python scripts/infer/summarize_musa_plus_per_label.py \
 After these finish, compare the HaN-Seg test summary with the SegRap test
 summary using the same metrics: all-OAR Dice, small-OAR Dice, large-OAR
 preservation, bone Dice, ROI Jacobian non-positive ratio, and residual DVF p95.
+
+## 7. Render Visual Comparisons
+
+The wrapper below selects representative test pairs from
+`stage2_vs_stage3_by_pair.csv`, runs single-pair inference to save warped
+images/segmentations, then renders MUSA Stage2 vs adaptive Stage3 PNG figures.
+
+```bash
+export SMALL_HANSEG="OAR_Cochlea_L,OAR_Cochlea_R,OAR_OpticNrv_L,OAR_OpticNrv_R,OAR_OpticChiasm,OAR_Pituitary,OAR_Glnd_Lacrimal_L,OAR_Glnd_Lacrimal_R"
+
+python scripts/infer/make_musa_plus_visual_comparison.py \
+  --data-root data_hanseg \
+  --model-type 05dualprnet-v1 \
+  --checkpoint-stage1 outputs_hanseg/paper_split_loss3_m05_stage1_r2/checkpoint/0500.pth \
+  --checkpoint-stage2 outputs_hanseg/paper_split_loss3_m05_stage2_r1/checkpoint/0500.pth \
+  --checkpoint-stage3 outputs_hanseg/paper_split_musa_plus_stage3_jac_safe/best_stage3_noharm.pth \
+  --metadata-path data_hanseg/metadata \
+  --small-oar-names "$SMALL_HANSEG" \
+  --compare-csv outputs_hanseg/paper_split_compare_stage2_stage3_safe_test_full/stage2_vs_stage3_by_pair.csv \
+  --selection top-small,worst-large,worst-jac \
+  --num-pairs 3 \
+  --output-dir outputs_hanseg/paper_split_visual_musa_vs_stage3_safe_test \
+  --gpu 0
+```
+
+Open `outputs_hanseg/paper_split_visual_musa_vs_stage3_safe_test/index.md` to
+inspect the generated figures.
+
+Color convention:
+
+- fixed label: green
+- original moving label: red
+- MUSA Stage2 warped label: cyan
+- adaptive Stage3 warped label: yellow
