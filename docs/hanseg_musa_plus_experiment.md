@@ -173,7 +173,11 @@ preservation, bone Dice, ROI Jacobian non-positive ratio, and residual DVF p95.
 
 The wrapper below selects representative test pairs from
 `stage2_vs_stage3_by_pair.csv`, runs single-pair inference to save warped
-images/segmentations, then renders MUSA Stage2 vs adaptive Stage3 PNG figures.
+images/segmentations, then renders two groups of PNG figures:
+
+- small-OAR alignment figures, focused on local organ contours
+- head-neck large-motion figures, focused on global CT posture, large/bone
+  contours, DVF magnitude, displacement vectors, and deformed grids
 
 ```bash
 export SMALL_HANSEG="OAR_Cochlea_L,OAR_Cochlea_R,OAR_OpticNrv_L,OAR_OpticNrv_R,OAR_OpticChiasm,OAR_Pituitary,OAR_Glnd_Lacrimal_L,OAR_Glnd_Lacrimal_R"
@@ -194,7 +198,10 @@ python scripts/infer/make_musa_plus_visual_comparison.py \
 ```
 
 Open `outputs_hanseg/paper_split_visual_musa_vs_stage3_safe_test/index.md` to
-inspect the generated figures.
+inspect the generated figures. Each pair folder will contain:
+
+- `viz_musa_vs_ours/`: local small-OAR comparison
+- `viz_headneck_motion/`: global head-neck motion comparison
 
 Color convention:
 

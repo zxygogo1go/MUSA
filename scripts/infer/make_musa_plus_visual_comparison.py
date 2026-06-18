@@ -177,7 +177,7 @@ def run_inference(args: argparse.Namespace, pair_dir: Path, moving_id: str, fixe
     run_command(command)
 
 
-def run_visualization(args: argparse.Namespace, pair_dir: Path, moving_id: str, fixed_id: str) -> Path:
+def run_small_oar_visualization(args: argparse.Namespace, pair_dir: Path, moving_id: str, fixed_id: str) -> Path:
     output_dir = pair_dir / "viz_musa_vs_ours"
     command = [
         sys.executable,
@@ -205,7 +205,29 @@ def run_visualization(args: argparse.Namespace, pair_dir: Path, moving_id: str, 
     return output_dir
 
 
-def write_index(output_dir: Path, pair_viz_dirs: Sequence[Tuple[str, str, Path]]) -> None:
+def run_headneck_motion_visualization(args: argparse.Namespace, pair_dir: Path, moving_id: str, fixed_id: str) -> Path:
+    output_dir = pair_dir / "viz_headneck_motion"
+    command = [
+        sys.executable,
+        str(SCRIPT_DIR / "visualize_musa_plus_headneck_motion.py"),
+        "--pair-dir",
+        str(pair_dir),
+        "--data-root",
+        args.data_root,
+        "--moving-id",
+        moving_id,
+        "--fixed-id",
+        fixed_id,
+        "--output-dir",
+        str(output_dir),
+        "--dpi",
+        str(args.dpi),
+    ]
+    run_command(command)
+    return output_dir
+
+
+def write_index(output_dir: Path, pair_viz_dirs: Sequence[Tuple[str, str, Path, Path]]) -> None:
     lines = [
         "# MUSA Stage2 vs Proposed Stage3 Visual Comparison",
         "",
@@ -217,18 +239,30 @@ def write_index(output_dir: Path, pair_viz_dirs: Sequence[Tuple[str, str, Path]]
         "- proposed Stage3 warped label: yellow",
         "",
     ]
-    figure_names = [
+    small_figure_names = [
         "01_small_oar_stage2_vs_stage3_overlay.png",
         "02_small_oar_ct_difference.png",
         "03_top_small_oar_gains.png",
         "04_small_oar_worst_deltas.png",
     ]
-    for moving_id, fixed_id, viz_dir in pair_viz_dirs:
+    motion_figure_names = [
+        "01_global_ct_motion_stage1_stage2_stage3.png",
+        "02_large_structure_motion_contours.png",
+        "03_dvf_magnitude_stage2_stage3_residual.png",
+        "04_deformation_grid_and_vectors.png",
+    ]
+    for moving_id, fixed_id, small_viz_dir, motion_viz_dir in pair_viz_dirs:
         prefix = pair_prefix(moving_id, fixed_id)
-        rel_dir = viz_dir.relative_to(output_dir)
+        small_rel_dir = small_viz_dir.relative_to(output_dir)
+        motion_rel_dir = motion_viz_dir.relative_to(output_dir)
         lines.extend([f"## {prefix}", ""])
-        for name in figure_names:
-            lines.append(f"![{prefix} {name}]({rel_dir / name})")
+        lines.extend(["### Small-OAR Alignment", ""])
+        for name in small_figure_names:
+            lines.append(f"![{prefix} {name}]({small_rel_dir / name})")
+            lines.append("")
+        lines.extend(["### Head-Neck Large-Motion Diagnostics", ""])
+        for name in motion_figure_names:
+            lines.append(f"![{prefix} {name}]({motion_rel_dir / name})")
             lines.append("")
     (output_dir / "index.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -247,15 +281,16 @@ def main() -> None:
     else:
         raise ValueError("Provide either --pairs-csv or --compare-csv")
 
-    pair_viz_dirs: List[Tuple[str, str, Path]] = []
+    pair_viz_dirs: List[Tuple[str, str, Path, Path]] = []
     for index, (moving_id, fixed_id) in enumerate(pairs, start=1):
         prefix = pair_prefix(moving_id, fixed_id)
         pair_dir = output_dir / prefix
         pair_dir.mkdir(parents=True, exist_ok=True)
         print(f"[{index}/{len(pairs)}] {moving_id} -> {fixed_id}", flush=True)
         run_inference(args, pair_dir, moving_id, fixed_id)
-        viz_dir = run_visualization(args, pair_dir, moving_id, fixed_id)
-        pair_viz_dirs.append((moving_id, fixed_id, viz_dir))
+        small_viz_dir = run_small_oar_visualization(args, pair_dir, moving_id, fixed_id)
+        motion_viz_dir = run_headneck_motion_visualization(args, pair_dir, moving_id, fixed_id)
+        pair_viz_dirs.append((moving_id, fixed_id, small_viz_dir, motion_viz_dir))
 
     write_index(output_dir, pair_viz_dirs)
     print(f"[INFO] Wrote visual comparison index: {output_dir / 'index.md'}")
