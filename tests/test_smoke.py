@@ -52,6 +52,25 @@ class SmokeTests(unittest.TestCase):
 
         np.testing.assert_allclose(warped.detach().numpy(), src.detach().numpy(), atol=1e-5)
 
+    def test_crs_transform_direction_and_residual_target(self):
+        import musa
+        from musa.utils_warp import SpatialTransformer
+
+        fixed = torch.zeros(1, 1, 12, 12, 12)
+        fixed[:, :, 3:9, 4:8, 5:9] = 1.0
+        known_gt_dvf = torch.zeros(1, 3, 12, 12, 12)
+        known_gt_dvf[:, 2] = 1.0
+        transformer = SpatialTransformer((12, 12, 12))
+
+        counterfactual_moving = transformer(fixed, -known_gt_dvf, mode="nearest")
+        recovered = transformer(counterfactual_moving, known_gt_dvf, mode="nearest")
+        np.testing.assert_allclose(recovered.detach().numpy(), fixed.detach().numpy(), atol=1e-5)
+
+        stage2_dvf = known_gt_dvf * 0.25
+        residual = musa.utils_crs.ResidualTargetBuilder.build_additive(known_gt_dvf, stage2_dvf)
+        reconstructed = musa.utils_crs.ResidualTargetBuilder.reconstruct_additive(stage2_dvf, residual)
+        np.testing.assert_allclose(reconstructed.detach().numpy(), known_gt_dvf.detach().numpy(), atol=1e-6)
+
     def test_dataprep_onehot(self):
         import musa
 

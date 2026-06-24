@@ -13,7 +13,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -38,6 +38,22 @@ def parse_int_tuple(value: str) -> Tuple[int, ...]:
     values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
     if not values:
         raise ValueError("Expected at least one integer")
+    return values
+
+
+def parse_float_tuple(value: str, expected_len: Optional[int] = None) -> Tuple[float, ...]:
+    values = tuple(float(part.strip()) for part in value.split(",") if part.strip())
+    if not values:
+        raise ValueError("Expected at least one float")
+    if expected_len is not None and len(values) != expected_len:
+        raise ValueError(f"Expected {expected_len} floats, got {values}")
+    return values
+
+
+def parse_string_tuple(value: str) -> Tuple[str, ...]:
+    values = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not values:
+        raise ValueError("Expected at least one string")
     return values
 
 
@@ -136,6 +152,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--best-large-drop-penalty", type=float, default=2.0, help="Penalty for negative large-OAR delta.")
     parser.add_argument("--best-bone-drop-penalty", type=float, default=2.0, help="Penalty for negative bone delta.")
     parser.add_argument("--best-residual-p95-penalty", type=float, default=0.0, help="Optional penalty for ROI residual p95.")
+
+    parser.add_argument("--use-crs", action="store_true", help="Enable Counterfactual Registrar Spectroscopy training.")
+    parser.add_argument("--crs-batch-ratio", type=float, default=0.5, help="Probability of using a CRS batch per step.")
+    parser.add_argument("--crs-warmup-epochs", type=int, default=5, help="Uniform CRS sampling epochs before adaptive sampling.")
+    parser.add_argument(
+        "--crs-probe-modes",
+        default="translation,rotation,anisotropic_scale,shear,bending,low_frequency_bspline",
+        help="Comma-separated CRS probe modes.",
+    )
+    parser.add_argument(
+        "--crs-amplitude-mm",
+        default="1,2,3,4,5,6",
+        help="Comma-separated synthetic deformation amplitudes in mm.",
+    )
+    parser.add_argument(
+        "--crs-support-radius-mm",
+        default="8,12,16,24",
+        help="Comma-separated local support radii in mm.",
+    )
+    parser.add_argument(
+        "--crs-spacing-mm",
+        default="2,2,2",
+        help="Prepared voxel spacing in mm as x,y,z. Default matches repository preprocessing.",
+    )
+    parser.add_argument("--crs-uniform-exploration", type=float, default=0.20, help="Uniform exploration mass for CRS sampler.")
+    parser.add_argument("--crs-sampler-temperature", type=float, default=1.0, help="Softmax temperature for CRS sampler.")
+    parser.add_argument("--lambda-cf-residual", type=float, default=1.0, help="CRS effective residual supervision weight.")
+    parser.add_argument("--lambda-cf-final", type=float, default=1.0, help="CRS final DVF supervision weight.")
+    parser.add_argument(
+        "--crs-outside-roi-weight",
+        type=float,
+        default=0.05,
+        help="Small CRS supervision weight outside target/support ROI to discourage residual leakage.",
+    )
+    parser.add_argument("--crs-stats-output-dir", default=None, help="Output directory for CRS JSON/CSV/TensorBoard stats.")
+    parser.add_argument("--crs-cache-dir", default=None, help="Optional directory for cached CRS pairs and Stage-2 outputs.")
+    parser.add_argument("--crs-seed", type=int, default=1337, help="CRS sampler/generator seed.")
     return parser.parse_args()
 
 
@@ -245,6 +298,8 @@ def run_two_stage_frozen(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     model_type = musa.utils_model_zoo.normalize_model_type(model_type)
     flag_pad = model_type.startswith("04transmorph-v1")
+    model_stage1.eval()
+    model_stage2.eval()
 
     with torch.no_grad():
         moving_r2 = musa.utils_warp.vol_downsamplex2(moving)
@@ -264,6 +319,35 @@ def run_two_stage_frozen(
         dvf_stage2 = composer_r1(dvf_r1_stage1, dvf_r1_stage2)
         deformed_stage2 = spatial_transformer_r1(moving, dvf_stage2, mode="bilinear")
     return deformed_stage2.detach(), dvf_stage2.detach()
+
+
+class FrozenRegistrarProbeRunner:
+    """Run the real frozen Stage-1/Stage-2 registrar for CRS probes."""
+
+    def __init__(
+        self,
+        model_stage1: torch.nn.Module,
+        model_stage2: torch.nn.Module,
+        model_type: str,
+        spatial_transformer_r1: torch.nn.Module,
+        composer_r1: torch.nn.Module,
+    ) -> None:
+        self.model_stage1 = model_stage1
+        self.model_stage2 = model_stage2
+        self.model_type = model_type
+        self.spatial_transformer_r1 = spatial_transformer_r1
+        self.composer_r1 = composer_r1
+
+    def __call__(self, moving: torch.Tensor, fixed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return run_two_stage_frozen(
+            moving=moving,
+            fixed=fixed,
+            model_stage1=self.model_stage1,
+            model_stage2=self.model_stage2,
+            model_type=self.model_type,
+            spatial_transformer_r1=self.spatial_transformer_r1,
+            composer_r1=self.composer_r1,
+        )
 
 
 def batch_to_device(batch, device: torch.device):
@@ -446,6 +530,7 @@ def stage3_forward(
             }
 
     metrics = {
+        "crs_batch": 0.0,
         "loss": float(loss.detach().cpu()),
         "loss_local_img": float(loss_local_img.detach().cpu()),
         "loss_small": float(loss_small.detach().cpu()),
@@ -486,11 +571,323 @@ def stage3_forward(
     return loss, metrics
 
 
+def stage3_forward_crs(
+    batch,
+    model_stage1: torch.nn.Module,
+    model_stage2: torch.nn.Module,
+    model_stage3: torch.nn.Module,
+    model_type: str,
+    spatial_transformer_r1: torch.nn.Module,
+    composer_r1: torch.nn.Module,
+    small_oar_labels: Sequence[int],
+    args: argparse.Namespace,
+    device: torch.device,
+    crs_generator: musa.utils_crs.AnatomicalCounterfactualProbeGenerator,
+    crs_sampler: musa.utils_crs.BlindSpectrumSampler,
+    crs_analyzer: musa.utils_crs.RegistrarResponseAnalyzer,
+    crs_probe_runner: FrozenRegistrarProbeRunner,
+    epoch: int,
+    crs_modes: Sequence[str],
+    crs_amplitudes_mm: Sequence[float],
+    crs_support_radii_mm: Sequence[float],
+    crs_cache: Optional[musa.utils_crs.CounterfactualProbeCache] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    cache_record = crs_cache.sample(device) if crs_cache is not None else None
+    if cache_record is not None:
+        fixed = cache_record["fixed"].to(device)
+        fixed_seg_o = cache_record["fixed_seg_o"].to(device)
+        fixed_seg_b = cache_record["fixed_seg_b"].to(device)
+        moving = cache_record["moving"].to(device)
+        moving_seg_o = cache_record["moving_seg_o"].to(device)
+        moving_seg_b = cache_record["moving_seg_b"].to(device)
+        known_gt_dvf = cache_record["known_gt_dvf"].to(device)
+        support = cache_record["support"].to(device)
+        deformed_stage2 = cache_record["deformed_stage2"].to(device)
+        dvf_stage2 = cache_record["dvf_stage2"].to(device)
+        metadata = musa.utils_crs.metadata_from_cache(cache_record["metadata"])
+    else:
+        _, fixed, _, fixed_seg_o, _, fixed_seg_b, _, _ = batch_to_device(batch, device)
+        specs = crs_sampler.sample_specs(
+            batch_size=fixed.shape[0],
+            labels=small_oar_labels,
+            modes=crs_modes,
+            amplitudes_mm=crs_amplitudes_mm,
+            support_radii_mm=crs_support_radii_mm,
+            epoch=epoch,
+            warmup_epochs=args.crs_warmup_epochs,
+        )
+        probe = crs_generator.generate(
+            fixed_ct=fixed,
+            fixed_seg_o=fixed_seg_o,
+            fixed_seg_b=fixed_seg_b,
+            probe_specs=specs,
+        )
+        moving = probe["counterfactual_moving_ct"]
+        moving_seg_o = probe["counterfactual_moving_seg_o"]
+        moving_seg_b = probe["counterfactual_moving_seg_b"]
+        known_gt_dvf = probe["known_gt_dvf"]
+        support = probe["support"]
+        metadata = probe["metadata"]
+        deformed_stage2, dvf_stage2 = crs_probe_runner(moving=moving, fixed=fixed)
+        if crs_cache is not None:
+            crs_cache.save(
+                {
+                    "fixed": fixed,
+                    "fixed_seg_o": fixed_seg_o,
+                    "fixed_seg_b": fixed_seg_b,
+                    "moving": moving,
+                    "moving_seg_o": moving_seg_o,
+                    "moving_seg_b": moving_seg_b,
+                    "known_gt_dvf": known_gt_dvf,
+                    "support": support,
+                    "deformed_stage2": deformed_stage2,
+                    "dvf_stage2": dvf_stage2,
+                    "metadata": metadata,
+                }
+            )
+
+    moving_oar = musa.utils_musa_plus.seg_to_foreground_mask(moving_seg_o)
+    fixed_oar = musa.utils_musa_plus.seg_to_foreground_mask(fixed_seg_o)
+    moving_small = musa.utils_musa_plus.seg_to_label_mask(moving_seg_o, small_oar_labels)
+    fixed_small = musa.utils_musa_plus.seg_to_label_mask(fixed_seg_o, small_oar_labels)
+    moving_large = (moving_oar - moving_small).clamp(0.0, 1.0)
+    fixed_large = (fixed_oar - fixed_small).clamp(0.0, 1.0)
+    moving_bone = (moving_seg_b > 0).float()
+    fixed_bone = (fixed_seg_b > 0).float()
+
+    warped_small_stage2 = spatial_transformer_r1(moving_small, dvf_stage2, mode="bilinear").clamp(0.0, 1.0)
+    warped_large_stage2 = spatial_transformer_r1(moving_large, dvf_stage2, mode="bilinear").clamp(0.0, 1.0)
+    warped_bone_stage2 = spatial_transformer_r1(moving_bone, dvf_stage2, mode="bilinear").clamp(0.0, 1.0)
+
+    conditioning = musa.utils_musa_plus.stage3_conditioning_masks(
+        input_mode=args.stage3_input_mode,
+        fixed_small_mask=fixed_small,
+        warped_small_mask_stage2=warped_small_stage2,
+        fixed_bone_mask=fixed_bone,
+    )
+    if args.stage3_input_mode == "no-fixed-seg":
+        difficulty = musa.utils_musa_plus.estimate_pair_difficulty_ct_only(
+            moving=moving,
+            fixed=fixed,
+            deformed_stage2=deformed_stage2,
+            dvf_stage2=dvf_stage2,
+        )
+    else:
+        stage2_small_roi = torch.maximum(fixed_small, warped_small_stage2.detach())
+        difficulty = musa.utils_musa_plus.estimate_stage2_pair_difficulty(
+            fixed=fixed,
+            deformed_stage2=deformed_stage2,
+            dvf_stage2=dvf_stage2,
+            warped_small_mask_stage2=warped_small_stage2,
+            fixed_small_mask=fixed_small,
+            warped_bone_mask_stage2=warped_bone_stage2,
+            fixed_bone_mask=fixed_bone,
+            image_mask=stage2_small_roi,
+        )
+    roi_radius = musa.utils_musa_plus.difficulty_to_radius_per_batch(
+        difficulty,
+        radius_min=args.roi_radius_min,
+        radius_max=args.roi_radius_max,
+    )
+    roi_gate = musa.utils_musa_plus.build_roi_gate_per_batch(
+        conditioning["roi_source"],
+        radii=roi_radius,
+        smooth_steps=args.roi_smooth_steps,
+    )
+    supervision_roi = torch.maximum(roi_gate, support.to(device=device, dtype=roi_gate.dtype)).clamp(0.0, 1.0)
+
+    stage3_inputs = musa.utils_musa_plus.make_stage3_inputs(
+        fixed=fixed,
+        deformed_stage2=deformed_stage2,
+        fixed_small_mask=conditioning["fixed_small_feature"],
+        warped_small_mask_stage2=warped_small_stage2,
+        dvf_stage2=dvf_stage2,
+        fixed_bone_mask=conditioning["fixed_bone_feature"],
+        warped_bone_mask_stage2=warped_bone_stage2,
+    )
+    raw_local_dvf = model_stage3(stage3_inputs)
+    residual_scale = musa.utils_musa_plus.difficulty_to_value(
+        difficulty,
+        args.residual_scale_min,
+        args.residual_scale_max,
+    ).view(-1, 1, 1, 1, 1)
+    local_dvf = raw_local_dvf * residual_scale
+    gated_local_dvf = local_dvf * roi_gate
+    dvf_final = dvf_stage2 + gated_local_dvf
+
+    deformed_final = spatial_transformer_r1(moving, dvf_final, mode="bilinear")
+    warped_small_final = spatial_transformer_r1(moving_small, dvf_final, mode="bilinear").clamp(0.0, 1.0)
+    warped_large_final = spatial_transformer_r1(moving_large, dvf_final, mode="bilinear").clamp(0.0, 1.0)
+    warped_bone_final = spatial_transformer_r1(moving_bone, dvf_final, mode="bilinear").clamp(0.0, 1.0)
+
+    anatomy_maps = musa.utils_musa_plus.build_anatomy_maps(
+        fixed_bone_mask=conditioning["anatomy_bone"],
+        roi_gate=supervision_roi,
+        difficulty=difficulty,
+    )
+    lambda_smooth = args.lambda_smooth + args.lambda_smooth_extra * difficulty
+
+    gt_effective_residual = musa.utils_crs.ResidualTargetBuilder.build_additive(known_gt_dvf, dvf_stage2)
+    loss_cf_residual_per_pair = musa.utils_crs.masked_charbonnier_per_batch(
+        gated_local_dvf,
+        gt_effective_residual,
+        supervision_roi,
+        outside_weight=args.crs_outside_roi_weight,
+    )
+    loss_cf_final_per_pair = musa.utils_crs.masked_epe_per_batch(
+        dvf_final,
+        known_gt_dvf,
+        supervision_roi,
+        outside_weight=args.crs_outside_roi_weight,
+    )
+    loss_local_img_per_pair = musa.utils_musa_plus.masked_mse_loss_per_batch(deformed_final, fixed, roi_gate)
+    loss_small_per_pair = musa.utils_musa_plus.binary_dice_loss_per_batch(warped_small_final, fixed_small)
+    loss_smooth_per_pair = musa.utils_musa_plus.weighted_gradient_loss_per_batch(gated_local_dvf, anatomy_maps["smooth"])
+    loss_mag_per_pair = musa.utils_musa_plus.weighted_magnitude_loss_per_batch(local_dvf, anatomy_maps["magnitude"])
+    loss_jacobian_per_pair = musa.utils_musa_plus.jacobian_hinge_loss_per_batch(
+        dvf_final,
+        roi_gate=supervision_roi,
+        margin=args.jacobian_margin,
+        roi_weight=args.jacobian_roi_weight,
+    )
+    loss_preserve_large_per_pair = musa.utils_musa_plus.binary_dice_loss_per_batch(
+        warped_large_final,
+        warped_large_stage2.detach(),
+    )
+    loss_preserve_bone_per_pair = musa.utils_musa_plus.binary_dice_loss_per_batch(
+        warped_bone_final,
+        warped_bone_stage2.detach(),
+    )
+
+    loss_per_pair = (
+        args.lambda_cf_residual * loss_cf_residual_per_pair
+        + args.lambda_cf_final * loss_cf_final_per_pair
+        + lambda_smooth * loss_smooth_per_pair
+        + args.lambda_mag * loss_mag_per_pair
+        + args.lambda_jacobian * loss_jacobian_per_pair
+        + args.lambda_preserve_large * loss_preserve_large_per_pair
+        + args.lambda_preserve_bone * loss_preserve_bone_per_pair
+    )
+    loss = loss_per_pair.mean()
+
+    loss_cf_residual = loss_cf_residual_per_pair.mean()
+    loss_cf_final = loss_cf_final_per_pair.mean()
+    loss_local_img = loss_local_img_per_pair.mean()
+    loss_small = loss_small_per_pair.mean()
+    loss_smooth = loss_smooth_per_pair.mean()
+    loss_mag = loss_mag_per_pair.mean()
+    loss_jacobian = loss_jacobian_per_pair.mean()
+    loss_preserve_large = loss_preserve_large_per_pair.mean()
+    loss_preserve_bone = loss_preserve_bone_per_pair.mean()
+
+    with torch.no_grad():
+        small_stage2_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_small_stage2, fixed_small).mean()
+        small_final_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_small_final, fixed_small).mean()
+        large_stage2_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_large_stage2, fixed_large).mean()
+        large_final_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_large_final, fixed_large).mean()
+        bone_stage2_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_bone_stage2, fixed_bone).mean()
+        bone_final_dice = musa.utils_musa_plus.binary_dice_per_batch(warped_bone_final, fixed_bone).mean()
+        residual_stats = musa.utils_musa_plus.magnitude_stats(gated_local_dvf, supervision_roi)
+        stage2_jac = {
+            "global_nonpos_ratio": 0.0,
+            "roi_nonpos_ratio": 0.0,
+            "roi_min": 0.0,
+        }
+        final_jac = {
+            "global_nonpos_ratio": 0.0,
+            "roi_nonpos_ratio": 0.0,
+            "roi_min": 0.0,
+        }
+        response_rows = crs_analyzer.compute_rows(
+            metadata=metadata,
+            stage2_dvf=dvf_stage2,
+            final_dvf=dvf_final,
+            known_gt_dvf=known_gt_dvf,
+            roi_mask=supervision_roi,
+        )
+        crs_analyzer.update(response_rows)
+        crs_sampler.update_from_rows(response_rows)
+        crs_stage2_blind = float(np.mean([row["stage2_blind_ratio"] for row in response_rows]))
+        crs_stage2_gain = float(np.mean([row["stage2_recovery_gain"] for row in response_rows]))
+        crs_stage3_error = float(np.mean([row["stage3_final_error"] for row in response_rows]))
+        crs_residual_gain = float(np.mean([row["residual_recovery_gain"] for row in response_rows]))
+
+    metrics = {
+        "crs_batch": 1.0,
+        "loss": float(loss.detach().cpu()),
+        "loss_cf_residual": float(loss_cf_residual.detach().cpu()),
+        "loss_cf_final": float(loss_cf_final.detach().cpu()),
+        "loss_local_img": float(loss_local_img.detach().cpu()),
+        "loss_small": float(loss_small.detach().cpu()),
+        "loss_smooth": float(loss_smooth.detach().cpu()),
+        "loss_mag": float(loss_mag.detach().cpu()),
+        "loss_jacobian": float(loss_jacobian.detach().cpu()),
+        "loss_preserve_large": float(loss_preserve_large.detach().cpu()),
+        "loss_preserve_bone": float(loss_preserve_bone.detach().cpu()),
+        "difficulty": float(difficulty.mean().detach().cpu()),
+        "roi_radius": float(roi_radius.float().mean().detach().cpu()),
+        "roi_radius_min": float(roi_radius.float().min().detach().cpu()),
+        "roi_radius_max": float(roi_radius.float().max().detach().cpu()),
+        "residual_scale": float(residual_scale.mean().detach().cpu()),
+        "lambda_small": 0.0,
+        "lambda_smooth": float(lambda_smooth.mean().detach().cpu()),
+        "small_stage2_dice": float(small_stage2_dice.detach().cpu()),
+        "small_final_dice": float(small_final_dice.detach().cpu()),
+        "small_delta": float((small_final_dice - small_stage2_dice).detach().cpu()),
+        "large_stage2_dice": float(large_stage2_dice.detach().cpu()),
+        "large_final_dice": float(large_final_dice.detach().cpu()),
+        "large_delta": float((large_final_dice - large_stage2_dice).detach().cpu()),
+        "bone_stage2_dice": float(bone_stage2_dice.detach().cpu()),
+        "bone_final_dice": float(bone_final_dice.detach().cpu()),
+        "bone_delta": float((bone_final_dice - bone_stage2_dice).detach().cpu()),
+        "residual_mag_mean": residual_stats["global_mean"],
+        "residual_mag_p95": residual_stats["global_p95"],
+        "residual_mag_max": residual_stats["global_max"],
+        "residual_mag_roi_mean": residual_stats["roi_mean"],
+        "residual_mag_roi_p95": residual_stats["roi_p95"],
+        "residual_mag_roi_max": residual_stats["roi_max"],
+        "stage2_jac_nonpos": stage2_jac["global_nonpos_ratio"],
+        "stage2_jac_roi_nonpos": stage2_jac["roi_nonpos_ratio"],
+        "stage2_jac_roi_min": stage2_jac["roi_min"],
+        "final_jac_nonpos": final_jac["global_nonpos_ratio"],
+        "final_jac_roi_nonpos": final_jac["roi_nonpos_ratio"],
+        "final_jac_roi_min": final_jac["roi_min"],
+        "crs_stage2_blind_ratio": crs_stage2_blind,
+        "crs_stage2_recovery_gain": crs_stage2_gain,
+        "crs_stage3_final_error": crs_stage3_error,
+        "crs_residual_recovery_gain": crs_residual_gain,
+    }
+    return loss, metrics
+
+
+def assert_frozen_registrar_gradients_none(
+    model_stage1: torch.nn.Module,
+    model_stage2: torch.nn.Module,
+) -> None:
+    for name, model in (("Stage1", model_stage1), ("Stage2", model_stage2)):
+        bad = [param_name for param_name, parameter in model.named_parameters() if parameter.grad is not None]
+        if bad:
+            raise RuntimeError(f"{name} registrar received gradients during Stage-3 training: {bad[:5]}")
+
+
+def build_tensorboard_writer(log_dir: Path):
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("[WARN] TensorBoard is not installed; CRS JSON/CSV stats will still be written.")
+        return None
+    return SummaryWriter(log_dir=str(log_dir))
+
+
 def mean_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
     if not rows:
         return {}
-    keys = rows[0].keys()
-    return {key: float(np.mean([row[key] for row in rows])) for key in keys}
+    keys = sorted(set().union(*(row.keys() for row in rows)))
+    return {
+        key: float(np.mean([row[key] for row in rows if key in row]))
+        for key in keys
+        if any(key in row for row in rows)
+    }
 
 
 def format_metrics(prefix: str, epoch: int, epochs: int, metrics: Dict[str, float], seconds: float) -> str:
@@ -542,6 +939,7 @@ def save_checkpoint(
     best_val_noharm_score: float,
     best_val_selection_score: float,
     history: Dict[str, List[Dict[str, float]]],
+    crs_sampler_state: Optional[Dict[str, object]] = None,
 ) -> None:
     checkpoint = {
         "epoch": epoch,
@@ -555,6 +953,8 @@ def save_checkpoint(
         "best_policy": args.best_policy,
         "history": history,
     }
+    if crs_sampler_state is not None:
+        checkpoint["crs_sampler_state"] = crs_sampler_state
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
 
@@ -607,6 +1007,65 @@ def main() -> None:
     filters = parse_int_tuple(args.filters)
     model_stage3 = LocalResidualUNet(in_channels=7, out_channels=3, filters=filters).to(device)
     optimizer = torch.optim.Adam(model_stage3.parameters(), lr=args.lr)
+    crs_modes = parse_string_tuple(args.crs_probe_modes)
+    crs_amplitudes_mm = parse_float_tuple(args.crs_amplitude_mm)
+    crs_support_radii_mm = parse_float_tuple(args.crs_support_radius_mm)
+    crs_spacing_mm = parse_float_tuple(args.crs_spacing_mm, expected_len=3)
+    if not 0.0 <= args.crs_batch_ratio <= 1.0:
+        raise ValueError(f"--crs-batch-ratio must be in [0,1], got {args.crs_batch_ratio}")
+    if not 0.0 <= args.crs_outside_roi_weight <= 1.0:
+        raise ValueError(f"--crs-outside-roi-weight must be in [0,1], got {args.crs_outside_roi_weight}")
+
+    crs_generator = None
+    crs_sampler = None
+    crs_analyzer = None
+    crs_cache = None
+    crs_probe_runner = None
+    crs_step_rng = np.random.default_rng(args.crs_seed + 17)
+    if args.use_crs:
+        crs_stats_dir = Path(args.crs_stats_output_dir) if args.crs_stats_output_dir else out_dir / "crs_stats"
+        crs_writer = build_tensorboard_writer(crs_stats_dir / "tensorboard")
+        crs_generator = musa.utils_crs.AnatomicalCounterfactualProbeGenerator(
+            small_oar_labels=small_oar_labels,
+            spacing_mm=crs_spacing_mm,
+            probe_modes=crs_modes,
+            amplitude_mm=crs_amplitudes_mm,
+            support_radius_mm=crs_support_radii_mm,
+            seed=args.crs_seed,
+        )
+        crs_sampler = musa.utils_crs.BlindSpectrumSampler(
+            uniform_exploration=args.crs_uniform_exploration,
+            temperature=args.crs_sampler_temperature,
+            seed=args.crs_seed + 1,
+        )
+        crs_analyzer = musa.utils_crs.RegistrarResponseAnalyzer(output_dir=crs_stats_dir, writer=crs_writer)
+        crs_probe_runner = FrozenRegistrarProbeRunner(
+            model_stage1=model_stage1,
+            model_stage2=model_stage2,
+            model_type=model_type,
+            spatial_transformer_r1=spatial_transformer_r1,
+            composer_r1=composer_r1,
+        )
+        if args.crs_cache_dir:
+            crs_cache = musa.utils_crs.CounterfactualProbeCache(
+                cache_dir=Path(args.crs_cache_dir),
+                signature={
+                    "model_type": model_type,
+                    "stage1": str(Path(args.model_load_stage1).resolve()),
+                    "stage2": str(Path(args.model_load_stage2).resolve()),
+                },
+                seed=args.crs_seed + 2,
+            )
+        print(
+            "[INFO] CRS enabled: "
+            f"ratio={args.crs_batch_ratio}, warmup={args.crs_warmup_epochs}, "
+            f"modes={crs_modes}, amplitudes_mm={crs_amplitudes_mm}, radii_mm={crs_support_radii_mm}",
+            flush=True,
+        )
+
+    def current_crs_sampler_state() -> Optional[Dict[str, object]]:
+        return crs_sampler.state_dict() if crs_sampler is not None else None
+
     epoch_start = 0
     best_val_small_dice = 0.0
     best_val_noharm_score = float("-inf")
@@ -622,6 +1081,8 @@ def main() -> None:
         best_val_noharm_score = float(checkpoint.get("best_val_noharm_score", float("-inf")))
         best_val_selection_score = float(checkpoint.get("best_val_selection_score", float("-inf")))
         history = checkpoint.get("history", history)
+        if crs_sampler is not None and "crs_sampler_state" in checkpoint:
+            crs_sampler.load_state_dict(checkpoint["crs_sampler_state"])
         print(f"[INFO] Resumed Stage-3 checkpoint {args.checkpoint_path} at epoch {epoch_start}")
 
     for epoch in range(epoch_start, args.epochs):
@@ -632,25 +1093,55 @@ def main() -> None:
             if step >= args.steps_per_epoch:
                 break
             optimizer.zero_grad()
-            loss, metrics = stage3_forward(
-                batch=batch,
-                model_stage1=model_stage1,
-                model_stage2=model_stage2,
-                model_stage3=model_stage3,
-                model_type=model_type,
-                spatial_transformer_r1=spatial_transformer_r1,
-                composer_r1=composer_r1,
-                small_oar_labels=small_oar_labels,
-                args=args,
-                device=device,
-            )
+            use_crs_step = bool(args.use_crs and crs_step_rng.random() < args.crs_batch_ratio)
+            if use_crs_step:
+                loss, metrics = stage3_forward_crs(
+                    batch=batch,
+                    model_stage1=model_stage1,
+                    model_stage2=model_stage2,
+                    model_stage3=model_stage3,
+                    model_type=model_type,
+                    spatial_transformer_r1=spatial_transformer_r1,
+                    composer_r1=composer_r1,
+                    small_oar_labels=small_oar_labels,
+                    args=args,
+                    device=device,
+                    crs_generator=crs_generator,
+                    crs_sampler=crs_sampler,
+                    crs_analyzer=crs_analyzer,
+                    crs_probe_runner=crs_probe_runner,
+                    epoch=epoch,
+                    crs_modes=crs_modes,
+                    crs_amplitudes_mm=crs_amplitudes_mm,
+                    crs_support_radii_mm=crs_support_radii_mm,
+                    crs_cache=crs_cache,
+                )
+            else:
+                loss, metrics = stage3_forward(
+                    batch=batch,
+                    model_stage1=model_stage1,
+                    model_stage2=model_stage2,
+                    model_stage3=model_stage3,
+                    model_type=model_type,
+                    spatial_transformer_r1=spatial_transformer_r1,
+                    composer_r1=composer_r1,
+                    small_oar_labels=small_oar_labels,
+                    args=args,
+                    device=device,
+                )
             loss.backward()
+            assert_frozen_registrar_gradients_none(model_stage1, model_stage2)
             optimizer.step()
             train_rows.append(metrics)
 
         train_metrics = mean_metrics(train_rows)
         history["train"].append(train_metrics)
         print(format_metrics("Train", epoch + 1, args.epochs, train_metrics, time.time() - train_start), flush=True)
+        if crs_analyzer is not None:
+            crs_analyzer.save()
+            crs_analyzer.log_tensorboard(epoch + 1)
+            if crs_analyzer.writer is not None:
+                crs_analyzer.writer.flush()
 
         if (epoch + 1) % args.epoch_val == 0:
             model_stage3.eval()
@@ -696,6 +1187,7 @@ def main() -> None:
                     best_val_noharm_score,
                     best_val_selection_score,
                     history,
+                    crs_sampler_state=current_crs_sampler_state(),
                 )
                 print(f"[INFO] Saved best small-Dice Stage-3 checkpoint with small Dice {best_val_small_dice:.4f}")
 
@@ -712,6 +1204,7 @@ def main() -> None:
                     best_val_noharm_score,
                     best_val_selection_score,
                     history,
+                    crs_sampler_state=current_crs_sampler_state(),
                 )
                 print(f"[INFO] Saved best no-harm Stage-3 checkpoint with score {best_val_noharm_score:.6f}")
 
@@ -728,6 +1221,7 @@ def main() -> None:
                     best_val_noharm_score,
                     best_val_selection_score,
                     history,
+                    crs_sampler_state=current_crs_sampler_state(),
                 )
                 print(f"[INFO] Saved selected best Stage-3 checkpoint with score {best_val_selection_score:.6f}")
 
@@ -744,6 +1238,7 @@ def main() -> None:
                 best_val_noharm_score,
                 best_val_selection_score,
                 history,
+                crs_sampler_state=current_crs_sampler_state(),
             )
             print(f"[INFO] Checkpoint saved to {checkpoint_path}")
 
@@ -758,8 +1253,11 @@ def main() -> None:
         best_val_noharm_score,
         best_val_selection_score,
         history,
+        crs_sampler_state=current_crs_sampler_state(),
     )
     print(f"[INFO] Final Stage-3 checkpoint saved to {out_dir / 'final_stage3.pth'}")
+    if crs_analyzer is not None and crs_analyzer.writer is not None:
+        crs_analyzer.writer.close()
 
 
 if __name__ == "__main__":

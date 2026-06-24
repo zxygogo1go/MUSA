@@ -1,0 +1,243 @@
+请在现有 M05+MUSA Stage1/Stage2 + adaptive Stage3 safe 代码中新增
+Counterfactual Registrar Spectroscopy（CRS）训练分支。
+
+总体原则：
+1. Stage1/Stage2 始终冻结，设置 eval()，且不计算梯度。
+2. CRS 只在训练阶段使用。
+3. 测试和部署仍走当前 Stage3 推理路径，不增加额外网络或 Stage2 调用。
+4. 不替换现有真实 longitudinal pair 训练，而是采用 real batch 与
+   counterfactual batch 混合训练。
+
+一、新增 AnatomicalCounterfactualProbeGenerator
+
+输入：
+- fixed_ct: [B, 1, D, H, W]
+- fixed small-OAR masks
+- fixed large-OAR masks
+- fixed bone mask
+- voxel spacing
+- 随机选择的 target small-OAR label
+
+输出：
+- counterfactual_moving_ct
+- counterfactual_moving_masks
+- known_gt_dvf
+- probe metadata
+
+以 target small OAR 的质心、bounding box 和 distance transform 为中心，
+生成局部平滑形变。第一版支持以下 probe mode：
+
+- translation
+- rotation
+- anisotropic scale
+- shear
+- bending
+- low-frequency B-spline deformation
+
+所有位移幅度必须以毫米配置，再根据 spacing 转换为 voxel displacement。
+形变仅在 target OAR 周围的平滑 support 内生效，support radius 可从
+8、12、16、24 mm 中采样。建议位移幅度先使用 1～6 mm。
+
+优先生成 smooth stationary velocity field，并通过现有 scaling-and-squaring
+工具得到 deformation；若项目中没有该工具，也可以先生成平滑 DVF，但必须
+拒绝明显 folding 的 synthetic probe。
+
+生成伪 moving 后，额外施加不改变几何关系的 appearance augmentation：
+- HU scale/shift
+- gamma 或局部 contrast
+- Gaussian noise
+- Gaussian blur
+- low-frequency bias field
+
+必须增加 transform-direction unit test，确认：
+
+warp(counterfactual_moving_ct, known_gt_dvf) ≈ fixed_ct
+
+这里 known_gt_dvf 的方向必须与当前项目 warp() 和 Stage2 DVF 的方向完全一致，
+不要根据公式猜测方向。
+
+二、新增 FrozenRegistrarProbeRunner
+
+将 counterfactual pair 送入真实的冻结 Stage1/Stage2，获得：
+
+- stage2_dvf_cf
+- stage2_warped_moving_ct_cf
+- stage2_warped_masks_cf
+- Stage2 DVF magnitude
+- 当前 Stage3 所需的其他输入
+
+CRS Stage3 输入必须与真实推理时完全一致，即继续使用：
+
+- fixed CT
+- Stage2 warped moving CT
+- fixed/warped small-OAR masks
+- fixed/warped bone masks
+- Stage2 DVF magnitude
+- 现有 adaptive difficulty features
+
+不要让 Stage3 直接看到 probe mode、known_gt_dvf 或 synthetic parameters，
+避免标签泄漏。
+
+三、新增 ResidualTargetBuilder
+
+根据当前代码实际使用的 DVF 更新方式构造精确 residual target。
+
+如果当前 final_dvf 是：
+
+final_dvf = stage2_dvf + effective_residual
+
+则定义：
+
+gt_effective_residual = known_gt_dvf - stage2_dvf_cf
+
+其中：
+
+effective_residual =
+    roi_gate * residual_scale * predicted_residual
+
+直接监督 effective_residual，不要用 gt_effective_residual 除以 roi_gate 或
+residual_scale，否则 gate 边缘会出现数值爆炸。
+
+如果代码改成 transformation composition，则实现统一的 compose_dvf() 和
+invert_dvf()，构造 residual_transform，使其满足：
+
+compose(stage2_transform, residual_transform) ≈ known_gt_transform
+
+无论采用 additive 还是 compositional convention，都必须增加单元测试，保证
+将 Stage2 与 gt residual 合并后能够重建 known_gt_dvf。
+
+四、新增 RegistrarResponseAnalyzer
+
+对每个 synthetic probe 计算：
+
+stage2_residual_error =
+    masked_EPE(stage2_dvf_cf, known_gt_dvf)
+
+stage2_blind_ratio =
+    ||known_gt_dvf - stage2_dvf_cf||_ROI
+    / (||known_gt_dvf||_ROI + eps)
+
+stage2_recovery_gain =
+    1 - stage2_blind_ratio
+
+Stage3 后继续计算：
+
+stage3_final_error =
+    masked_EPE(final_dvf_cf, known_gt_dvf)
+
+residual_recovery_gain =
+    1 - stage3_final_error
+        / (stage2_residual_error + eps)
+
+统计维度至少包括：
+
+- target OAR label
+- deformation mode
+- amplitude bin
+- support-radius bin
+- OAR-volume bin
+
+将统计结果以 JSON/CSV 和 TensorBoard 形式保存，从而可以绘制 Stage2 和
+Stage2+Stage3 的 deformation response heatmap。
+
+五、新增 BlindSpectrumSampler
+
+为每个 probe bin 维护 EMA 统计：
+
+ema_blind_score =
+    EMA(stage2_blind_ratio)
+
+ema_stage3_error =
+    EMA(stage3_final_error / (stage2_residual_error + eps))
+
+采样权重建议为：
+
+score =
+    ema_blind_score * ema_stage3_error
+
+probability =
+    softmax(score / temperature)
+
+保留至少 20% uniform exploration，避免采样器只集中到少数模式。
+
+训练前 5 个 epoch 使用 uniform probe sampling；之后启用 blind-spectrum
+adaptive sampling。
+
+第一版不要实现 GAN 或复杂 adversarial red-team generator。先实现参数化
+probe bank + adaptive hard sampling，保证可复现和训练稳定。
+
+六、修改 Stage3 trainer
+
+每个 iteration 按 crs_batch_ratio 决定使用真实 pair 或 counterfactual pair。
+建议初始配置：
+
+crs_batch_ratio = 0.5
+
+真实 longitudinal batch：
+- 完全保留现有 adaptive Stage3 safe 训练逻辑
+- 保留 small-OAR、image、smoothness、Jacobian、large-OAR/bone preservation
+  和 no-harm 相关目标
+
+counterfactual batch：
+- 运行 CounterfactualProbeGenerator
+- 运行冻结的 Stage1/Stage2
+- 构建与真实推理完全相同的 Stage3 输入
+- 预测 residual
+- 构建 final_dvf
+- 使用 known_gt_dvf 提供精确监督
+
+建议新增：
+
+L_cf_residual =
+    masked Charbonnier(
+        effective_predicted_residual,
+        gt_effective_residual
+    )
+
+L_cf_final =
+    masked EPE(final_dvf_cf, known_gt_dvf)
+
+L_cf =
+    lambda_cf_residual * L_cf_residual
+    + lambda_cf_final * L_cf_final
+    + 现有 safe regularization
+
+初始建议：
+
+lambda_cf_residual = 1.0
+lambda_cf_final = 1.0
+
+所有超参数写入 config，不要硬编码。
+
+ROI 建议使用 target OAR adaptive ROI 与 synthetic deformation support 的并集。
+ROI 外只保留较小权重，用于防止 residual 向外泄漏。
+
+七、增加配置项
+
+use_crs
+crs_batch_ratio
+crs_warmup_epochs
+crs_probe_modes
+crs_amplitude_mm
+crs_support_radius_mm
+crs_uniform_exploration
+crs_sampler_temperature
+lambda_cf_residual
+lambda_cf_final
+crs_stats_output_dir
+crs_cache_dir
+
+支持可选 offline cache：
+预先生成 counterfactual pair、Stage2 输出及 residual target，减少重复运行
+Stage1/Stage2 的训练成本。
+
+八、验收条件
+
+1. use_crs=false 时，训练和推理行为必须与当前代码一致。
+2. Stage1/Stage2 参数 gradient 始终为 None。
+3. synthetic pair 的 known_gt_dvf 能正确恢复 fixed CT 和 masks。
+4. Stage2 与 gt residual 合并后能数值上重建 known_gt_dvf。
+5. Stage3 输入中不得包含 known deformation parameters。
+6. 推理时不创建 CounterfactualProbeGenerator 和 BlindSpectrumSampler。
+7. 日志中能够按 mode、amplitude、radius 和 OAR 输出 Stage2 recovery gain
+   及 Stage3 residual recovery gain。
